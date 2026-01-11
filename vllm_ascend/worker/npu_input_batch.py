@@ -73,11 +73,14 @@ class NPUInputBatch(InputBatch):
         self.is_token_ids_tensor = torch.zeros(
             (max_num_reqs, max_model_len), device="cpu", dtype=bool, pin_memory=False
         )
+        # token_top_ks
+        self.token_top_ks_cpu_tensor: torch.Tensor | None = None
         self.is_token_ids = self.is_token_ids_tensor.numpy()
         # Store prompt embeddings per request to avoid OOM from large upfront
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
         self.req_prompt_embeds: dict[int, torch.Tensor] = {}
+
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
@@ -211,3 +214,19 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def initialize_token_top_ks(self, num_moe_layers: int, base_top_k: int):
+        self.token_top_ks_cpu_tensor = torch.full(
+            (self.max_num_reqs, self.max_model_len, num_moe_layers),
+            base_top_k,
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+
+    @property
+    def token_top_ks_cpu(self) -> np.ndarray:
+        if self.token_top_ks_cpu_tensor is None:
+            raise ValueError("token_top_ks_cpu_tensor is not initialized.")
+        return self.token_top_ks_cpu_tensor.numpy()
+

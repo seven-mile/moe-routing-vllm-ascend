@@ -19,6 +19,9 @@
 
 import math
 import sys
+import re
+import time
+import warnings
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -670,6 +673,13 @@ class NPUModelRunner(GPUModelRunner):
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
+        # Prepare token_top_ks
+        torch.index_select(
+            self.input_batch.token_top_ks_cpu_tensor.flatten(0, 1),
+            0,
+            token_indices_tensor,
+            out=self.input_top_ks.cpu[:total_num_scheduled_tokens],
+        )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
@@ -944,14 +954,22 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
+
+        # Compute draft token top_ks
+        draft_token_top_ks = self.input_top_ks.gpu[logits_indices]
+        draft_token_top_ks = draft_token_top_ks[target_logits_indices + 1]
+
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
+            draft_token_top_ks=draft_token_top_ks,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
             cu_num_sampled_tokens=cu_num_sampled_tokens,
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            num_moe_layers=self.model.num_moe_layers if hasattr(self.model, 'num_moe_layers') else 0,
+            base_top_k=self.model_config.get_num_experts_per_token(),
         )
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
@@ -967,16 +985,19 @@ class NPUModelRunner(GPUModelRunner):
         hidden_states: torch.Tensor,
         aux_hidden_states: torch.Tensor = None,
         sample_hidden_states: torch.Tensor = None,
-    ) -> list[list[int]] | None:
+    ) -> tuple[list[list[int]] | torch.Tensor, torch.Tensor | None]:
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
+            draft_token_top_ks = None
         elif isinstance(self.drafter, (AscendNgramProposer, AscendSuffixDecodingProposer)):
             draft_token_ids = self.drafter.propose(valid_sampled_token_ids)
+            draft_token_top_ks = None
         elif isinstance(self.drafter, AscendMedusaProposer):
             draft_token_ids = self.drafter.propose(
                 valid_sampled_token_ids, sampling_metadata, spec_decode_metadata, sample_hidden_states
             )
+            draft_token_top_ks = None
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
@@ -1080,7 +1101,7 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
-            draft_token_ids = self.drafter._propose(
+            draft_token_ids, draft_token_logits = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -1096,10 +1117,20 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
+
+            actions = scheduler_output.scheduled_req_dyn_assisted_action_configs
+            actions = [actions[req_id] for req_id in self.input_batch.req_ids]
+
+            # NOTE(seven-mile): The shape changes here.
+            # draft_token_logits: gamma token logits
+            # draft_token_top_ks: 1+gamma token topks
+            draft_token_top_ks = self.drafter.get_token_top_ks_from_proposals(
+                draft_token_ids, draft_token_logits, actions,
+            )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
-        return draft_token_ids
+        return draft_token_ids, draft_token_top_ks
 
     @torch.inference_mode()
     def execute_model(
@@ -1265,6 +1296,7 @@ class NPUModelRunner(GPUModelRunner):
 
             (
                 input_ids,
+                input_top_ks,
                 inputs_embeds,
                 positions,
                 intermediate_tensors,
@@ -1328,6 +1360,7 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                     skip_compiled=has_encoder_input,
+                    token_top_ks=input_top_ks,
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
@@ -1348,6 +1381,7 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                     skip_compiled=has_encoder_input,
+                    token_top_ks=input_top_ks,
                 ),
                 self.maybe_get_kv_connector_output(
                     scheduler_output, clear_metadata=clear_kv_metadata
@@ -1512,6 +1546,7 @@ class NPUModelRunner(GPUModelRunner):
         (
             logprobs_lists,
             valid_sampled_token_ids,
+            valid_token_top_ks,
             prompt_logprobs_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
@@ -1555,6 +1590,7 @@ class NPUModelRunner(GPUModelRunner):
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
+            token_top_ks=valid_token_top_ks,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             kv_connector_output=kv_connector_output,
@@ -1593,6 +1629,7 @@ class NPUModelRunner(GPUModelRunner):
         return AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
+            sampled_token_top_ks=sampler_output.sampled_token_top_ks,
             logprobs_tensors=sampler_output.logprobs_tensors,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
@@ -1654,24 +1691,40 @@ class NPUModelRunner(GPUModelRunner):
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
+        sampled_token_top_ks = sampler_output.sampled_token_top_ks
+        next_draft_first_token_top_ks = (
+            self._draft_token_top_ks[:, 0:]
+            if self._draft_token_top_ks is not None
+            else torch.tensor([
+                [[8 for _ in range(self.model.num_moe_layers)]]
+                for _ in range(num_sampled_tokens)
+            ], device='cpu')
+        )
         invalid_req_indices = []
-        cu_num_tokens: list[int] | None = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
+            logprobs_lists = None
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[int(i)].clear()
+
+                if logprobs_tensors is not None:
+                    logprobs_lists = logprobs_tensors.tolists()
+
+                valid_token_top_ks = next_draft_first_token_top_ks.tolist()
             else:
                 # Includes spec decode tokens.
-                valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+                valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
+                    sampled_token_top_ks=sampled_token_top_ks,
+                    next_draft_first_token_top_ks=next_draft_first_token_top_ks,
                 )
         else:
             valid_sampled_token_ids = []
@@ -1688,6 +1741,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.prev_req_id_to_index = {
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
+            assert False, "async scheduler compatibility NYI"
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -1723,12 +1777,6 @@ class NPUModelRunner(GPUModelRunner):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
-        logprobs_lists = (
-            logprobs_tensors.tolists(cu_num_tokens)
-            if not self.use_async_scheduling and logprobs_tensors is not None
-            else None
-        )
-
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
@@ -1738,6 +1786,7 @@ class NPUModelRunner(GPUModelRunner):
         return (
             logprobs_lists,
             valid_sampled_token_ids,
+            valid_token_top_ks,
             prompt_logprobs_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
@@ -2389,9 +2438,11 @@ class NPUModelRunner(GPUModelRunner):
             assert num_tokens_padded <= self.max_num_tokens
             if self.is_multimodal_model and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
                 input_ids = None
+                input_top_ks = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
+                input_top_ks = self.input_top_ks.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
             if self.uses_mrope:
@@ -2450,6 +2501,7 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
+                token_top_ks=input_top_ks,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -2540,6 +2592,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+
+        self._reinitialize_token_top_ks_buffer()
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():

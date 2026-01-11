@@ -105,6 +105,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         activation: str = "silu",
         enable_force_load_balance: bool = False,
         log2phy: torch.Tensor = None,
+        token_top_ks: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
@@ -115,6 +116,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
+            layer_idx=layer.layer_idx,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
@@ -122,6 +124,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts,
+            token_top_ks=token_top_ks,
         )
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -410,6 +413,8 @@ class AscendFusedMoE(FusedMoE):
         enable_force_load_balance = _EXTRA_CTX.in_profile_run
 
         forward_context = get_forward_context()
+        token_top_ks = forward_context.token_top_ks
+
         if self.multistream_overlap_gate:
             assert AscendFusedMoE.gate_stream is not None
             fc3_context = get_flash_common3_context()
@@ -434,6 +439,7 @@ class AscendFusedMoE(FusedMoE):
                     top_k=self.top_k,
                     use_grouped_topk=self.use_grouped_topk,
                     renormalize=self.renormalize,
+                    layer_idx=self.layer_idx,
                     topk_group=self.topk_group,
                     num_expert_group=self.num_expert_group,
                     custom_routing_function=self.custom_routing_function,
@@ -441,6 +447,7 @@ class AscendFusedMoE(FusedMoE):
                     routed_scaling_factor=self.routed_scaling_factor,
                     e_score_correction_bias=self.e_score_correction_bias,
                     global_num_experts=self.global_num_experts,
+                    token_top_ks=token_top_ks,
                 )
 
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
@@ -449,9 +456,10 @@ class AscendFusedMoE(FusedMoE):
 
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
-        hidden_states, router_logits, mc2_mask, context_metadata = _EXTRA_CTX.moe_comm_method.prepare(
+        hidden_states, router_logits, token_top_ks, mc2_mask, context_metadata = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
+            token_top_ks=token_top_ks,
             replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type,
@@ -489,6 +497,9 @@ class AscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
+            # NOTE(seven-mile): AscendUnquantizedFusedMoEMethod basically
+            # integrates select_experts into itself. So we need to pass token_top_ks to it.
+            token_top_ks=token_top_ks,
         )
 
         if self.dynamic_eplb:

@@ -87,14 +87,15 @@ class MoECommMethod(ABC):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        token_top_ks: torch.Tensor | None = None,
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type: QuantType = QuantType.NONE,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        hidden_states, router_logits, mc2_mask, context_metadata = self.prepare_finalize.prepare(
-            hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce, quant_type
-        )
-        return hidden_states, router_logits, mc2_mask, context_metadata
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        hidden_states, router_logits, token_top_ks, mc2_mask, context_metadata = self.prepare_finalize.prepare(
+            hidden_states, router_logits, token_top_ks, enable_shared_expert_dp,
+            replace_allreduce, quant_type)
+        return hidden_states, router_logits, token_top_ks, mc2_mask, context_metadata
 
     def finalize(
         self, hidden_states: torch.Tensor, reduce_results: bool, context_metadata: dict | None = None
