@@ -69,6 +69,7 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
+    token_top_ks: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -82,6 +83,7 @@ def set_ascend_forward_context(
         "cudagraph_runtime_mode": aclgraph_runtime_mode,
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
+        "token_top_ks": token_top_ks,
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
@@ -269,7 +271,8 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
         )
         num_experts_per_device = num_experts // ep_world_size
-        if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
+        # if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
+        if num_tokens <= mc2_tokens_capacity:
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLGATHER

@@ -28,6 +28,7 @@ def select_experts(
     top_k: int,
     use_grouped_topk: bool,
     renormalize: bool,
+    layer_idx: int | None = None,
     topk_group: int | None = None,
     num_expert_group: int | None = None,
     custom_routing_function: Callable | None = None,
@@ -39,6 +40,7 @@ def select_experts(
     num_logical_experts: int = -1,
     num_shared_experts: int = 0,
     num_experts: int = -1,
+    token_top_ks: torch.Tensor | None = None,
 ):
     """
     Fused experts with select experts.
@@ -49,6 +51,7 @@ def select_experts(
         top_k: number of top k experts.
         use_grouped_topk: Whether to group experts before selecting top-k.
         renormalize: Whether to renormalize the routing weights.
+        layer_idx: Index of the MoE layer.
         topk_group: Number of expert groups to select from.
         num_expert_group: Number of experts in each group.
         custom_routing_function: Custom routing function.
@@ -56,6 +59,7 @@ def select_experts(
         e_score_correction_bias: Correction bias to apply to expert scores.
         indices_type: dtype of indices
         num_experts: Number of experts.
+        token_top_ks: Tensor of shape (num_tokens, num_moe_layers) indicating top_k for each token each layer.
 
     Returns:
         topk_weights: router weights of shape (num_tokens, top_k).
@@ -71,6 +75,7 @@ def select_experts(
         renormalize=renormalize,
         topk_group=topk_group,
         num_expert_group=num_expert_group,
+        layer_idx=layer_idx,
         scoring_func=scoring_func,
         custom_routing_function=custom_routing_function,
     )
@@ -85,8 +90,11 @@ def select_experts(
             renormalize=renormalize,
             e_score_correction_bias=e_score_correction_bias,
             num_expert_group=num_expert_group,
+            layer_idx=layer_idx,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
+            num_experts=num_experts,
+            token_top_ks=token_top_ks,
         )
     else:
         topk_weights, topk_ids = _native_select_experts(
@@ -95,12 +103,14 @@ def select_experts(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
+            layer_idx=layer_idx,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             num_experts=num_experts,
+            token_top_ks=token_top_ks,
         )
     if mix_placement:
         shared_expert_routing_factor = 1.0 if is_support_npu_moe_gating_top_k else (1 / routed_scaling_factor)
@@ -128,6 +138,7 @@ def check_npu_moe_gating_top_k(
     renormalize: bool,
     topk_group: int | None = None,
     num_expert_group: int | None = None,
+    layer_idx: int | None = None,
     scoring_func: str = "softmax",
     custom_routing_function: Callable | None = None,
 ):
@@ -227,12 +238,14 @@ def _select_experts_with_fusion_ops(
     e_score_correction_bias: torch.Tensor | None,
     topk_group: int | None,
     num_expert_group: int | None,
+    layer_idx: int | None,
     scoring_func: str = "softmax",
     routed_scaling_factor=1.0,
+    num_experts: int = -1,
+    token_top_ks: torch.Tensor | None = None,
 ):
     topk_group = topk_group if topk_group is not None else 1
     num_expert_group = num_expert_group if num_expert_group is not None else 1
-    renorm = int(renormalize)
     norm_type = 0 if scoring_func == "softmax" else 1
     if e_score_correction_bias is not None and e_score_correction_bias.dtype != router_logits.dtype:
         e_score_correction_bias = e_score_correction_bias.to(router_logits.dtype)
@@ -242,14 +255,20 @@ def _select_experts_with_fusion_ops(
         k_group=topk_group,
         group_count=num_expert_group,
         group_select_mode=1,
-        renorm=renorm,
+        renorm=1 if renormalize else 0,
         norm_type=norm_type,  # 0: softmax; 1: sigmoid
         out_flag=False,
         routed_scaling_factor=routed_scaling_factor,
         eps=1e-20,
         bias_opt=e_score_correction_bias,
     )
-
+    _apply_token_top_ks(
+        topk_indices=topk_ids,
+        topk_weights=topk_weights,
+        layer_idx=layer_idx,
+        num_experts=num_experts,
+        token_top_ks=token_top_ks,
+    )
     return topk_weights, topk_ids
 
 
@@ -259,12 +278,14 @@ def _native_select_experts(
     top_k: int,
     use_grouped_topk: bool,
     renormalize: bool,
+    layer_idx: int | None,
     topk_group: int | None = None,
     num_expert_group: int | None = None,
     custom_routing_function: Callable | None = None,
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
     num_experts: torch.Tensor | None = None,
+    token_top_ks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Select top-k experts based on router logits.
@@ -275,11 +296,13 @@ def _native_select_experts(
         top_k: Number of experts to select.
         use_grouped_topk: Whether to group experts before selecting top-k.
         renormalize: Whether to renormalize the routing weights.
+        layer_idx: Index of the MoE layer.
         topk_group: Number of expert groups to select from.
         num_expert_group: Number of experts in each group.
         custom_routing_function: Custom routing function.
         scoring_func: Scoring function to use.
         e_score_correction_bias: Correction bias to apply to expert scores.
+        token_top_ks: Tensor of shape (num_tokens, num_moe_layers) indicating top_k for each token each layer.
 
     Returns:
         topk_weights: Routing weights of shape (num_tokens, top_k).
@@ -297,6 +320,7 @@ def _native_select_experts(
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
 
     if use_grouped_topk:
+        raise NotImplementedError
         return _select_expert_use_group_topk(
             topk_weights=topk_weights,
             top_k=top_k,
@@ -307,6 +331,7 @@ def _native_select_experts(
         )
 
     if custom_routing_function is not None:
+        raise NotImplementedError
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -324,6 +349,14 @@ def _native_select_experts(
     # Required by npu_moe_init_routing
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
+
+    _apply_token_top_ks(
+        topk_indices=topk_ids,
+        topk_weights=topk_weights,
+        layer_idx=layer_idx,
+        num_experts=num_experts,
+        token_top_ks=token_top_ks,
+    )
 
     return topk_weights, topk_ids
 
@@ -350,3 +383,30 @@ def zero_experts_compute(
     expert_scales = torch.where(normal_expert_mask, 0.0, expert_scales)
 
     return expert_indices, expert_scales, result
+
+
+def _apply_token_top_ks(
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    layer_idx: int | None,
+    num_experts: int,
+    token_top_ks: torch.Tensor | None = None,
+):
+    if token_top_ks is None:
+        return
+    # Mask out the invalid top-k weights for each token.
+    if token_top_ks.ndim == 2:
+        assert layer_idx is not None, "layer_idx must be provided for layerwise dynamic top-k"
+        token_top_ks = token_top_ks[:, layer_idx]
+    else:
+        assert token_top_ks.ndim == 1, "token_top_ks must be 1D or 2D"
+    assert token_top_ks.shape == topk_indices.shape[:-1], (
+        f"token_top_ks shape mismatch: {token_top_ks.shape} vs {topk_indices.shape}"
+    )
+    num_tokens, topk = topk_weights.shape
+    topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
+    if topk_indices.dtype == torch.uint32:
+        topk_indices = topk_indices.view(torch.int32)
+    topk_indices.masked_fill_(topk_mask, num_experts)
+    topk_weights.masked_fill_(topk_mask, 0.0)
+

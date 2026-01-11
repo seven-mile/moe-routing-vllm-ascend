@@ -93,6 +93,7 @@ class MoECommMethod(ABC):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        token_top_ks: torch.Tensor | None = None,
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type: QuantType = QuantType.NONE,
@@ -100,6 +101,7 @@ class MoECommMethod(ABC):
         return self.prepare_finalize.prepare(
             hidden_states,
             router_logits,
+            token_top_ks,
             enable_shared_expert_dp,
             replace_allreduce,
             quant_type,

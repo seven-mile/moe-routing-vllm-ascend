@@ -82,6 +82,8 @@ def apply_sampling_constraints(
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
+    # [num_tokens, num_moe_layers]
+    draft_token_top_ks: torch.Tensor,
     # [batch_size]
     num_draft_tokens: list[int],
     max_spec_len: int,
@@ -93,6 +95,8 @@ def rejection_sample(
     target_logits: torch.Tensor,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
+    num_moe_layers: int,
+    base_top_k: int,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
@@ -105,6 +109,7 @@ def rejection_sample(
     vocab_size = target_logits.shape[-1]
     device = target_logits.device
     assert draft_token_ids.is_contiguous()
+    assert draft_token_top_ks.shape[:-1] == draft_token_ids.shape
     assert draft_probs is None or draft_probs.is_contiguous()
     assert target_logits.is_contiguous()
     assert bonus_token_ids.is_contiguous()
@@ -122,6 +127,12 @@ def rejection_sample(
         device=device,
     )
     output_token_ids.fill_(PLACEHOLDER_TOKEN_ID)
+    output_token_top_ks = torch.empty(
+        (batch_size, max_spec_len + 1, num_moe_layers),
+        dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
+        device=device,
+    )
+    output_token_top_ks.fill_(base_top_k)
 
     if sampling_metadata.all_greedy:
         is_greedy = None
@@ -135,37 +146,34 @@ def rejection_sample(
         if HAS_TRITON:
             rejection_greedy_sample_with_triton(
                 output_token_ids,
+                output_token_top_ks,
                 num_draft_tokens,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 target_argmax,
                 bonus_token_ids,
                 is_greedy,
                 max_spec_len,
+                num_moe_layers,
                 grid,
                 block_size,
             )
         else:
-            if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and sampling_metadata.all_greedy:
-                rejection_greedy_sample_spec_len_1_pytorch(
-                    output_token_ids,
-                    draft_token_ids,
-                    target_argmax,
-                    bonus_token_ids,
-                )
-            else:
-                rejection_greedy_sample_pytorch(
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    target_argmax,
-                    bonus_token_ids,
-                    num_draft_tokens,
-                    max_spec_len,
-                    is_greedy,
-                )
+            rejection_greedy_sample_pytorch(
+                output_token_ids,
+                output_token_top_ks,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                draft_token_top_ks,
+                target_argmax,
+                bonus_token_ids,
+                num_draft_tokens,
+                max_spec_len,
+                is_greedy,
+            )
         if sampling_metadata.all_greedy:
-            return output_token_ids
+            return output_token_ids, output_token_top_ks
 
     # Compute probability distribution from target logits.
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
@@ -198,8 +206,10 @@ def rejection_sample(
         if HAS_TRITON:
             rejection_random_sample_kernel[(grid,)](
                 output_token_ids,
+                output_token_top_ks,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 draft_probs,
                 target_probs,
                 bonus_token_ids,
@@ -209,14 +219,17 @@ def rejection_sample(
                 max_spec_len,
                 vocab_size,
                 batch_size,
+                num_moe_layers,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
             )
         else:
             rejection_random_sample_pytorch(
                 output_token_ids,
+                output_token_top_ks,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 draft_probs,
                 target_probs,
                 bonus_token_ids,
@@ -233,8 +246,10 @@ def rejection_sample(
         if HAS_TRITON:
             rejection_random_sample_block_verify_kernel[(grid,)](
                 output_token_ids,
+                output_token_top_ks,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 draft_probs,
                 target_probs,
                 bonus_token_ids,
@@ -244,6 +259,7 @@ def rejection_sample(
                 max_spec_len,
                 vocab_size,
                 batch_size,
+                num_moe_layers,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
                 SUB_BLOCK=4 * 1024,
@@ -251,8 +267,10 @@ def rejection_sample(
         else:
             rejection_random_sample_block_verify_pytorch(
                 output_token_ids,
+                output_token_top_ks,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 draft_probs,
                 target_probs,
                 bonus_token_ids,
@@ -263,7 +281,7 @@ def rejection_sample(
                 vocab_size,
                 IS_NGRAM=draft_probs is None,
             )
-    return output_token_ids
+    return output_token_ids, output_token_top_ks
 
 
 def expand_batch_to_tokens(
@@ -397,8 +415,10 @@ def rejection_greedy_sample_spec_len_1_pytorch(
 
 def rejection_greedy_sample_pytorch(
     output_token_ids,  # [batch_size, max_spec_len + 1]
+    output_token_top_ks,  # [batch_size, max_spec_len + 1, num_moe_layers]
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
+    draft_token_top_ks,  # [num_tokens, num_moe_layers]
     target_argmax,  # [num_tokens]
     bonus_token_ids,  # [batch_size]
     draft_tokens_per_req,  # [batch_size], list
@@ -407,6 +427,7 @@ def rejection_greedy_sample_pytorch(
 ):
     batch_size = output_token_ids.size(0)
     num_tokens = draft_token_ids.size(0)
+    num_moe_layers = draft_token_top_ks.size(-1)
     device = output_token_ids.device
     draft_tokens_per_req = torch.tensor(draft_tokens_per_req).to(device, non_blocking=True)
     if is_greedy is None:
@@ -440,6 +461,7 @@ def rejection_greedy_sample_pytorch(
     final_copy_mask = copy_mask & greedy_mask
     global_idx = start_indices.unsqueeze(1) + copy_indices
     output_token_ids[final_copy_mask] = target_argmax[global_idx[final_copy_mask]].to(output_token_ids.dtype)
+    output_token_top_ks[final_copy_mask] = draft_token_top_ks[global_idx[final_copy_mask]].to(output_token_top_ks.dtype)
     # Fill bonus token.
     needs_bonus = is_greedy & (first_mismatch_pos_per_req >= draft_tokens_per_req)
     if torch.any(needs_bonus):
@@ -451,8 +473,10 @@ def rejection_greedy_sample_pytorch(
 
 def rejection_random_sample_pytorch(
     output_token_ids,  # [batch_size, max_spec_len + 1]
+    output_token_top_ks,  # [batch_size, max_spec_len + 1, num_moe_layers]
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
+    draft_token_top_ks,  # [num_tokens, num_moe_layers]
     draft_probs,  # [num_tokens, vocab_size] or None
     target_probs,  # [num_tokens, vocab_size]
     bonus_token_ids,  # [batch_size]
@@ -551,9 +575,17 @@ def rejection_random_sample_pytorch(
         recovered_tokens,
         torch.where(final_acceptance, draft_tokens, output_token_ids[:, :max_draft_len]),
     )
+    final_token_top_ks = torch.where(
+        final_acceptance,
+        draft_token_top_ks,
+        output_token_top_ks[:, :max_draft_len]
+    )
 
     output_token_ids[:, :max_draft_len] = torch.where(
         final_update_mask, final_tokens, output_token_ids[:, :max_draft_len]
+    )
+    output_token_top_ks[:, :max_draft_len] = torch.where(
+        final_update_mask, final_token_top_ks, output_token_top_ks[:, :max_draft_len]
     )
 
     no_rejection = first_reject_pos.squeeze(1) >= num_draft_per_batch
@@ -712,8 +744,10 @@ def sample_recovered_tokens_pytorch(
 
 def rejection_random_sample_block_verify_pytorch(
     output_token_ids,  # [batch_size, max_spec_len + 1]
+    output_token_top_ks,  # [batch_size, max_spec_len + 1, num_moe_layers]
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
+    draft_token_top_ks,  # [num_tokens, num_moe_layers]
     draft_probs,  # [num_tokens, vocab_size] or None
     target_probs,  # [num_tokens, vocab_size]
     bonus_token_ids,  # [batch_size, 1]
@@ -814,6 +848,7 @@ def rejection_random_sample_block_verify_pytorch(
 
     accept_mask = (i_indices <= last_accept_i[:, None]) & valid_mask & non_greedy_mask
     output_token_ids[:, :max_spec_len] = torch.where(accept_mask, draft_tokens, output_token_ids[:, :max_spec_len])
+    output_token_top_ks[:, :max_spec_len] = torch.where(accept_mask, draft_token_top_ks, output_token_top_ks[:, :max_spec_len])
 
     reject_mask = (i_indices == last_accept_i[:, None] + 1) & valid_mask & non_greedy_mask
     output_token_ids[:, :max_spec_len] = torch.where(reject_mask, recovered_tokens, output_token_ids[:, :max_spec_len])
@@ -827,6 +862,7 @@ def rejection_random_sample_block_verify_pytorch(
         bonus_token_ids.expand(-1, max_spec_len + 1).to(output_token_ids.dtype),
         output_token_ids,
     )
+    output_token_top_ks[:] = torch.where(bonus_mask, draft_token_top_ks, output_token_top_ks)
 
 
 def sample_recovered_tokens_blockwise_pytorch(

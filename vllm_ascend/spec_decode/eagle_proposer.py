@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm import envs
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.parallel_state import (
     get_pcp_group,
@@ -28,6 +29,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.udf import UserDefinedFunctionConfig, load_user_defined_function
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -38,6 +40,7 @@ from vllm.v1.spec_decode.utils import (
     compute_new_slot_mapping,
     extend_all_queries_by_N,
 )
+from vllm.v1.spec_decode.utils import calc_perplexity
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
@@ -524,6 +527,68 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
+    def get_token_top_ks_from_proposals(
+        self,
+        token_ids: torch.Tensor,
+        logits: torch.Tensor,
+        assisted_action_configs: list[str],
+    ) -> torch.Tensor:
+        """Get token top-k values from proposal probabilities.
+
+        Args:
+            proposals: SpeculativeProposals object containing proposal probabilities.
+        Returns:
+            A tensor of shape (batch_size, max_proposal_len) containing the top-k
+            values for each token in the proposals.
+        """
+        model_config = self.vllm_config.model_config
+        batch_size, spec_len = token_ids.shape
+        
+        base_top_k = model_config.get_num_experts_per_token()
+        target_model = self.runner.get_model()
+        num_layers = target_model.num_moe_layers
+        assert num_layers > 0, "No MoE layers found in the model."
+
+        # Assert input tensors are on-device.
+        assert token_ids.device.type == self.device.type, (
+            f"Expected token_ids to be on device {self.device.type}, "
+            f"but got {token_ids.device.type}."
+        )
+        assert logits.device.type == self.device.type, (
+            f"Expected logits to be on device {self.device.type}, "
+            f"but got {logits.device.type}."
+        )
+
+        ppls = calc_perplexity(logits, token_ids)
+
+        total_topks = torch.full(
+            (num_layers, batch_size, spec_len+1),
+            base_top_k,
+            device=self.device,
+        )
+
+        assert len(assisted_action_configs) == batch_size, \
+            f"Expected {batch_size} assisted action configs, " \
+            f"but got {len(assisted_action_configs)}"
+
+        for req_idx, action_cfg in enumerate(assisted_action_configs):
+            action_cfg = UserDefinedFunctionConfig.loads(action_cfg)
+            if action_cfg is None:
+                continue
+            action = load_user_defined_function(action_cfg)
+            with torch.device(self.device):
+                spec_topks = action(ppls[req_idx], model_config.hf_config)
+                # The output token guides the top-k of the input token.
+                total_topks[:, req_idx, :-1] = spec_topks
+                # The last token's top-k is determined by the mean k.
+                if envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN:
+                    last_topks = torch.mean(spec_topks, dim=-1, dtype=torch.float32)
+                    total_topks[:, req_idx, -1] = last_topks
+
+        # Swap num_layers to inner dim for better input organization.
+        total_topks = total_topks.permute(1, 2, 0).contiguous()
+        return total_topks
+
     def _propose(
         self,
         # [num_tokens]
@@ -932,7 +997,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             # [batch_size, 1]
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            return draft_token_ids.view(-1, self.num_speculative_tokens), logits
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
             draft_token_ids = logits.argmax(dim=-1)
@@ -950,10 +1015,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             batch_size = draft_token_ids.shape[0]
 
         # Generate the remaining draft tokens.
-        draft_token_ids_tensor = torch.zeros(
-            (self.num_speculative_tokens, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
-        )
-        draft_token_ids_tensor[0] = draft_token_ids
+        draft_token_ids_list = [draft_token_ids]
+        draft_token_logits_list = [logits]
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
@@ -976,8 +1039,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_tensor[draft_step]
-            positions += 1
+            input_ids = draft_token_ids_list[-1].int()
 
             # NOTE(woosuk): We should handle the case where the draft model
             # generates tokens beyond the max model length. Since it is complex
@@ -999,7 +1061,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[:batch_size] = hidden_states
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -1016,9 +1079,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # `model_hidden_states` represent the speculative model inputs.
             model_input_ids = self.input_ids[:input_batch_size]
             model_positions = self._get_positions(input_batch_size)
-            model_hidden_states = self.hidden_states[:input_batch_size]
+            if self.pass_hidden_states_to_model:
+                model_hidden_states = self.hidden_states[:input_batch_size]
 
-            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+                model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
 
             forward_context.attn_metadata = (
                 multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
@@ -1063,11 +1127,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
-            draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+            draft_token_ids_list.append(draft_token_ids)
+            draft_token_logits_list.append(logits)
 
         # [batch_size, num_speculative_tokens]
-        draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
-        return draft_token_ids
+        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        # [batch_size, num_speculative_tokens, vocab_size]
+        draft_token_logits = torch.stack(draft_token_logits_list, dim=1)
+        return draft_token_ids, draft_token_logits
 
     def set_inputs_first_pass(
         self,
@@ -1165,7 +1232,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 target_positions = target_positions[0]
 
             self._set_positions(num_tokens, target_positions)
-            self.hidden_states[:num_tokens] = target_hidden_states
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[:num_tokens] = target_hidden_states
 
             return num_tokens, token_indices_to_sample, cad, (query_lens_d, ori_token_indices_to_sample)
         else:

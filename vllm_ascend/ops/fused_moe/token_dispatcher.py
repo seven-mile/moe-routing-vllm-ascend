@@ -537,6 +537,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             num_out_tokens=num_out_tokens,
         )
 
+        # Masked tokens are sorted to the end, so we slice the valid tokens.
+        local_total_tokens = input_splits.sum()
+        permutated_local_input_tokens = permutated_local_input_tokens[
+            :local_total_tokens, :]
+
+
         return (
             permutated_local_input_tokens,
             reversed_local_input_permutation_mapping,
@@ -549,7 +555,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
 
     def _preprocess(self, topk_ids: torch.Tensor):
-        num_local_tokens_per_expert = torch.histc(topk_ids, bins=self.num_experts, min=0, max=self.num_experts)
+        num_local_tokens_per_expert = torch.histc(topk_ids, bins=self.num_experts, min=0, max=self.num_experts-1)
 
         ep_size = self.ep_size
         num_out_tokens = topk_ids.numel()
