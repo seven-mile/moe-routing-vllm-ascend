@@ -23,6 +23,7 @@ import itertools
 import math
 import re
 import time
+import warnings
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -197,6 +198,7 @@ class AsyncNPUModelRunnerOutput(AsyncModelRunnerOutput):
         self,
         model_runner_output: ModelRunnerOutput,
         sampled_token_ids: torch.Tensor,
+        sampled_token_top_ks: torch.Tensor,
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.npu.Stream,
     ):
@@ -209,12 +211,15 @@ class AsyncNPUModelRunnerOutput(AsyncModelRunnerOutput):
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
+        self._sampled_token_top_ks = sampled_token_top_ks
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.npu.current_stream()
         with torch.npu.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
             self._sampled_token_ids_cpu = self._sampled_token_ids.to(
+                'cpu', non_blocking=True)
+            self._sampled_token_top_ks_cpu = self._sampled_token_top_ks.to(
                 'cpu', non_blocking=True)
             self._async_copy_ready_event.record()
 
@@ -227,13 +232,17 @@ class AsyncNPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         # Release the device tensor once the copy has completed
         del self._sampled_token_ids
+        del self._sampled_token_top_ks
 
         valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
+        valid_sampled_token_top_ks = self._sampled_token_top_ks_cpu.tolist()
         for i in self._invalid_req_indices:
             valid_sampled_token_ids[i].clear()
+            valid_sampled_token_top_ks[i].clear()
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
+        output.sampled_token_top_ks = valid_sampled_token_top_ks
         return output
 
 
@@ -360,6 +369,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.input_ids = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int32,
                                      device=self.device)
+        self._input_top_ks: Optional[CpuGpuBuffer] = None
         self.positions = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int64,
                                      device=self.device)
@@ -462,6 +472,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Cached outputs.
         self._draft_token_ids: Optional[Union[list[list[int]],
                                               torch.Tensor]] = None
+        self._draft_token_top_ks: Optional[torch.Tensor] = None
 
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
@@ -529,6 +540,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                      dtype=torch.int64)
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs,
                                                   dtype=torch.int32)
+
+    @property
+    def input_top_ks(self) -> CpuGpuBuffer:
+        assert self._input_top_ks is not None
+        return self._input_top_ks
 
     def _may_pad_kv_consumer_num_seq(self):
         # For Full Graph + MTP in a PD (Prefill/Decode) disaggregation scenario,
@@ -741,16 +757,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.input_batch.num_tokens_no_spec[
                     req_index] = end_token_index
                 self.input_batch.num_tokens[req_index] = end_token_index
+                assert False, "PP support for token_top_ks NYI"
 
             # Add spec_token_ids to token_ids_cpu.
             spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+            spec_token_top_ks = (scheduler_output
+                .scheduled_spec_decode_token_top_ks.get(req_id, []))
             if spec_token_ids:
                 num_spec_tokens = len(spec_token_ids)
                 start_index = self.input_batch.num_tokens_no_spec[req_index]
                 end_token_index = start_index + num_spec_tokens
                 self.input_batch.token_ids_cpu[
                     req_index, start_index:end_token_index] = spec_token_ids
+                # NOTE(seven-mile): token topks is 1+gamma, the first k assists
+                # the last one of non-spec tokens.
+                self.input_batch.token_top_ks_cpu[
+                    req_index, start_index-1:end_token_index] = spec_token_top_ks
                 # NOTE(woosuk): `num_tokens` here may include spec tokens.
                 self.input_batch.num_tokens[req_index] += num_spec_tokens
 
@@ -1140,7 +1163,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.input_ids[:total_num_scheduled_tokens].copy_(
                 self.input_ids_cpu[:total_num_scheduled_tokens],
                 non_blocking=True)
+            self.input_top_ks.copy_to_gpu(total_num_scheduled_tokens)
             return
+
+        assert False, "Async scheduling top_ks NYI"
 
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
@@ -1336,6 +1362,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                            0,
                            torch.from_numpy(token_indices),
                            out=self.input_ids_cpu[:total_num_scheduled_tokens])
+        
+        # Prepare token_top_ks
+        torch.index_select(
+            self.input_batch.token_top_ks_cpu_tensor.flatten(0, 1),
+            0,
+            torch.from_numpy(token_indices),
+            out=self.input_top_ks.cpu[:total_num_scheduled_tokens])
 
         # Prepare some information for building Attention-Metadata
         # Compute and commit slot mapping
@@ -1412,12 +1445,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 inputs_embeds)
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
             input_ids = None
+            input_top_ks = None
+            assert False, "token_top_ks NYI"
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
             # then the embedding layer is not included in the ACL graph.
             input_ids = self.input_ids[:num_input_tokens]
+            input_top_ks = self.input_top_ks.gpu[:num_input_tokens]
             inputs_embeds = None
         positions = self.positions[:num_input_tokens]
         input_ids, positions = self._update_input_ids_and_positions(
@@ -1573,7 +1609,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_input_tokens, num_tokens_across_dp,
                 maybe_padded_num_tokens, logits_indices, spec_decode_metadata,
                 input_ids, inputs_embeds, intermediate_tensors,
-                max_num_scheduled_tokens)
+                max_num_scheduled_tokens, input_top_ks)
 
     def _generate_process_reqs_hidden_states(self, attn_metadata, with_prefill,
                                              maybe_padded_num_tokens,
@@ -1708,13 +1744,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         draft_token_ids = self.input_ids[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
+        # Compute draft token top_ks
+        draft_token_top_ks = self.input_top_ks.gpu[logits_indices]
+        draft_token_top_ks = draft_token_top_ks[target_logits_indices + 1]
+
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
+            draft_token_top_ks=draft_token_top_ks,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            num_moe_layers=self.model.num_moe_layers if hasattr(self.model, 'num_moe_layers') else 0,
+            base_top_k=self.model_config.get_num_experts_per_token(),
         )
         return metadata
 
@@ -1793,16 +1836,32 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         attn_metadata: dict[str, Any],
         aux_hidden_states: torch.Tensor = None,
-    ) -> Optional[list[list[int]]]:
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
+            draft_token_top_ks = None
+        elif isinstance(self.drafter, EagleProposer):
+            draft_token_ids, draft_token_logits = self.drafter.generate_token_ids(
+                valid_sampled_token_ids, sampling_metadata, scheduler_output,
+                spec_decode_metadata, positions, num_scheduled_tokens,
+                hidden_states, attn_metadata, aux_hidden_states)
+
+            actions = scheduler_output.scheduled_req_dyn_assisted_action_configs
+            actions = [actions[req_id] for req_id in self.input_batch.req_ids]
+
+            # NOTE(seven-mile): The shape changes here.
+            # draft_token_logits: gamma token logits
+            # draft_token_top_ks: 1+gamma token topks
+            draft_token_top_ks = self.drafter.get_token_top_ks_from_proposals(
+                draft_token_ids, draft_token_logits, actions)
         else:
             draft_token_ids = self.drafter.generate_token_ids(
                 valid_sampled_token_ids, sampling_metadata, scheduler_output,
                 spec_decode_metadata, positions, num_scheduled_tokens,
                 hidden_states, attn_metadata, aux_hidden_states)
-        return draft_token_ids
+            draft_token_top_ks = None
+        return draft_token_ids, draft_token_top_ks
 
     def _pool(
         self,
@@ -1813,6 +1872,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         finished_recving: Optional[set[str]] = None,
         kv_connector_output: Optional["KVConnectorOutput"] = None,
     ) -> ModelRunnerOutput:
+        raise NotImplementedError
         assert self.input_batch.num_reqs ==\
             len(self.input_batch.pooling_params), \
         "Either all or none of the requests in" \
@@ -1845,6 +1905,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=[],
+            token_top_ks=[],
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
@@ -1942,7 +2003,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
              num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
              logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
              intermediate_tensors,
-             max_query_len) = (self._prepare_inputs(scheduler_output,
+             max_query_len, input_top_ks) = (self._prepare_inputs(scheduler_output,
                                                     intermediate_tensors))
 
             if self.dynamic_eplb:
@@ -1975,7 +2036,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     total_num_scheduled_tokens,
                     prefetch_stream=self.prefetch_stream,
                     model_instance=self.model,
-                    weight_prefetch_method=self.weight_prefetch_method):
+                    weight_prefetch_method=self.weight_prefetch_method,
+                    token_top_ks=input_top_ks):
                 self.maybe_setup_kv_connector(scheduler_output)
 
                 hidden_states = self._generate_process_reqs_hidden_states(
@@ -2065,13 +2127,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # it is safe to update `target_logits` in place.
                 target_logits = logits[
                     spec_decode_metadata.target_logits_indices]
-                output_token_ids = self.rejection_sampler(
+                output_token_ids, output_token_top_ks = self.rejection_sampler(
                     spec_decode_metadata,
                     None,  # draft_probs
                     target_logits,
                     bonus_token_ids,
                     sampling_metadata,
                 )
+                # If it's spec decode, all accepted tokens are exactly what we want.
+                sampler_output.sampled_token_top_ks = output_token_top_ks
                 sampler_output.sampled_token_ids = output_token_ids
                 if self.need_accepted_tokens:
                     self._update_states_after_model_execute(output_token_ids)
@@ -2112,23 +2176,32 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
             sampled_token_ids = sampler_output.sampled_token_ids
+            sampled_token_top_ks = sampler_output.sampled_token_top_ks
+            next_draft_first_token_top_ks = self._draft_token_top_ks[:, 0:] if self._draft_token_top_ks is not None else None
             if not self.use_async_scheduling:
                 # Get the valid generated tokens.
                 max_gen_len = sampled_token_ids.shape[-1]
                 if max_gen_len == 1:
                     # No spec decode tokens.
                     valid_sampled_token_ids = sampled_token_ids.tolist()
+                    valid_token_top_ks = next_draft_first_token_top_ks.tolist() if next_draft_first_token_top_ks is not None else []
                 else:
                     # Includes spec decode tokens.
-                    valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                        sampled_token_ids,
-                        self.input_batch.vocab_size,
-                    )
+                    valid_sampled_token_ids, valid_token_top_ks = \
+                        self.rejection_sampler.parse_output(
+                            sampled_token_ids,
+                            sampled_token_top_ks,
+                            next_draft_first_token_top_ks,
+                            self.input_batch.vocab_size,
+                        )
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
+                    if valid_token_top_ks:
+                        valid_token_top_ks[i].clear()
             else:
                 valid_sampled_token_ids = []
+                valid_token_top_ks = []
                 invalid_req_indices = list(discard_sampled_tokens_req_indices)
                 invalid_req_indices_set = set(invalid_req_indices)
                 assert sampled_token_ids.shape[-1] == 1
@@ -2145,6 +2218,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     for i, req_id in enumerate(self.input_batch.req_ids)
                     if i not in invalid_req_indices_set
                 }
+                assert False, "async scheduler compatibility NYI"
             # Cache the sampled tokens in the model runner, so that the scheduler
             # doesn't need to send them back.
             # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -2154,8 +2228,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if self.use_async_scheduling:
                     sampled_ids = [-1] * 1 if \
                         req_idx not in invalid_req_indices_set else None
+                    sampled_top_ks = [] if \
+                        req_idx not in invalid_req_indices_set else None
                 else:
                     sampled_ids = valid_sampled_token_ids[req_idx]
+                    sampled_top_ks = valid_token_top_ks[req_idx] if valid_token_top_ks else []
                 if not sampled_ids:
                     continue
 
@@ -2168,6 +2245,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
                 self.input_batch.token_ids_cpu[req_idx,
                                                start_idx:end_idx] = sampled_ids
+                if sampled_top_ks:
+                    self.input_batch.token_top_ks_cpu[req_idx,
+                                                      start_idx:end_idx] = sampled_top_ks
                 self.input_batch.num_tokens_no_spec[req_idx] = end_idx
                 self.input_batch.num_tokens[req_idx] = end_idx
                 req_id = self.input_batch.req_ids[req_idx]
@@ -2175,7 +2255,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_state.output_token_ids.extend(sampled_ids)
 
             if self.speculative_config:
-                self._draft_token_ids = self.propose_draft_token_ids(
+                self._draft_token_ids, self._draft_token_top_ks = self.propose_draft_token_ids(
                     valid_sampled_token_ids,
                     sampling_metadata,
                     scheduler_output,
@@ -2196,6 +2276,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
+            token_top_ks=valid_token_top_ks,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
@@ -2219,6 +2300,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         return AsyncNPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampled_token_ids,
+            sampled_token_top_ks=sampled_token_top_ks,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
         )
@@ -2232,7 +2314,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
-        return DraftTokenIds(req_ids, draft_token_ids)
+        assert self._draft_token_top_ks is not None
+        draft_token_top_ks = self._draft_token_top_ks.tolist()
+        self._draft_token_top_ks = None
+        return DraftTokenIds(req_ids, draft_token_ids, draft_token_top_ks)
 
     def kv_connector_no_forward(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
@@ -2345,7 +2430,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def _generate_dummy_run_hidden_states(self, with_prefill,
                                           is_torchair_compile, input_ids,
                                           positions, attn_metadata, num_tokens,
-                                          intermediate_tensors, inputs_embeds):
+                                          intermediate_tensors, inputs_embeds,
+                                          token_top_ks):
         hidden_states = self.model(input_ids=input_ids,
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
@@ -2448,9 +2534,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                             num_scheduled_tokens):
             if self.is_multimodal_model:
                 input_ids = None
+                input_top_ks = None
                 inputs_embeds = self.inputs_embeds[:num_tokens]
             else:
                 input_ids = self.input_ids[:num_tokens]
+                input_top_ks = self.input_top_ks.gpu[:num_tokens]
                 inputs_embeds = None
 
             if self.uses_mrope:
@@ -2532,11 +2620,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     batch_descriptor=batch_descriptor,
                     prefetch_stream=self.prefetch_stream,
                     model_instance=self.model,
-                    weight_prefetch_method=self.weight_prefetch_method):
+                    weight_prefetch_method=self.weight_prefetch_method,
+                    token_top_ks=input_top_ks):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     with_prefill, is_torchair_compile, input_ids, positions,
                     attn_metadata, num_tokens, intermediate_tensors,
-                    inputs_embeds)
+                    inputs_embeds, input_top_ks)
                 dummy_compute_logits(hidden_states)
 
             if self.drafter:
@@ -2706,6 +2795,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                   self.device)
         logger.info("Loading model weights took %.4f GB",
                     m.consumed_memory / float(2**30))
+
+        self._reinitialize_token_top_ks_buffer()
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -3711,3 +3802,64 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def _build_drafter_prepare_inputs_torchair_param(self):
         return False
+
+    def _reinitialize_token_top_ks_buffer(self) -> None:
+        """
+        Re-initialize the token_top_ks buffer after loading the model.
+        """
+        if not is_moe_model(self.vllm_config):
+            warnings.warn(
+                "Reinitializing token_top_ks buffer for a non-MoE model.")
+            return
+        num_moe_layers = self.model.num_moe_layers
+        base_top_k = self.model_config.get_num_experts_per_token()
+        self.input_batch.initialize_token_top_ks(num_moe_layers, base_top_k)
+        
+        self._input_top_ks = self._make_buffer(self.max_num_tokens,
+                                               num_moe_layers,
+                                               dtype=torch.int32)
+
+    @contextmanager
+    def maybe_randomize_inputs(
+        self,
+        input_ids: torch.Tensor,
+        input_top_ks: Optional[torch.Tensor] = None,
+    ):
+        """
+        Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
+        This is to help balance expert-selection
+        """
+        # TODO(seven-mile): This function is intended to be called from dummy_run
+        # But right now, there is no place to call it.
+        if not torch.npu.is_current_stream_capturing():
+            yield
+            return
+
+        @functools.cache
+        def rand_input_ids() -> torch.Tensor:
+            return torch.randint_like(
+                self.input_ids.gpu,
+                low=0,
+                high=self.model_config.get_vocab_size(),
+                dtype=input_ids.dtype)
+
+        @functools.cache
+        def rand_input_top_ks() -> torch.Tensor:
+            base_top_k = self.model_config.get_num_experts_per_token()
+            return torch.randint_like(
+                self.input_ids.gpu,
+                low=1,
+                high=base_top_k, # intentionally exclusive
+                dtype=input_ids.dtype)
+
+        logger.debug_once("Randomizing dummy data for DP Rank")
+        input_ids.copy_(rand_input_ids()[:input_ids.size(0)],
+                        non_blocking=True)
+        if input_top_ks is not None:
+            input_top_ks.copy_(rand_input_top_ks()[:input_top_ks.size(0)],
+                               non_blocking=True)
+        yield
+        input_ids.fill_(0)
+        if input_top_ks is not None:
+            base_top_k = self.model_config.get_num_experts_per_token()
+            input_top_ks.fill_(base_top_k)

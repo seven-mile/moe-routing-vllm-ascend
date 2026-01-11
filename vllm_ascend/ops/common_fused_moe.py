@@ -88,6 +88,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
               top_k: int,
               router_logits: torch.Tensor,
               renormalize: bool,
+              layer_idx: int,
               topk_group: Optional[int] = None,
               num_expert_group: Optional[int] = None,
               custom_routing_function: Optional[Callable] = None,
@@ -99,6 +100,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
               apply_router_weight_on_input: bool = False,
               enable_force_load_balance: bool = False,
               shared_experts: Optional[Any] = None,
+              token_top_ks: Optional[torch.Tensor] = None,
               **kwargs) -> torch.Tensor:
 
         topk_weights, topk_ids = select_experts(
@@ -107,13 +109,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
+            layer_idx=layer_idx,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts)
+            global_num_experts=global_num_experts,
+            token_top_ks=token_top_ks,
+        )
 
         topk_weights = topk_weights.to(x.dtype)
         # this is a naive implementation for experts load balance so as
@@ -285,6 +290,8 @@ class AscendFusedMoE(FusedMoE):
 
         forward_context = get_forward_context()
 
+        token_top_ks = forward_context.token_top_ks
+
         # Load balancing for token distribution among experts in dummy_run
         # TODO: The community only considers load balancing when DP > 1.
         # This approach may overlook some extreme scenarios.
@@ -303,6 +310,7 @@ class AscendFusedMoE(FusedMoE):
             router_logits=router_logits,
             top_k=self.top_k,
             renormalize=self.renormalize,
+            layer_idx=self.layer_idx,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
             expert_map=self.expert_map,
@@ -318,7 +326,9 @@ class AscendFusedMoE(FusedMoE):
             shared_experts=None,
             enable_force_load_balance=enable_force_load_balance,
             log2phy=self.log2phy,
-            global_redundant_expert_num=self.global_redundant_expert_num)
+            global_redundant_expert_num=self.global_redundant_expert_num,
+            token_top_ks=token_top_ks,
+        )
 
         if isinstance(final_hidden_states, tuple):
             final_hidden_states, group_list_type, expert_tokens = final_hidden_states

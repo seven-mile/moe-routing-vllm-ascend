@@ -4,17 +4,20 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from vllm import envs
 from vllm.attention.layer import Attention
 from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models.interfaces import supports_multimodal, is_mixture_of_experts
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+from vllm.utils.udf import UserDefinedFunctionConfig, load_user_defined_function
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.utils import calc_perplexity
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -120,16 +123,81 @@ class EagleProposer(Proposer):
                   dummy_compute_logits=lambda hidden_states: None):
         moe_comm_type = self.runner._select_moe_comm_method(
             num_tokens, with_prefill)
-        with set_ascend_forward_context(None,
-                                        self.vllm_config,
-                                        moe_comm_type=moe_comm_type,
-                                        num_tokens=num_tokens):
-            self.model(
-                input_ids=self.input_ids[:num_tokens],
-                positions=self.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-            )
-            dummy_compute_logits(self.hidden_states)
+        for _ in range(self.vllm_config.speculative_config.num_speculative_tokens):
+            with set_ascend_forward_context(None,
+                                            self.vllm_config,
+                                            moe_comm_type=moe_comm_type,
+                                            num_tokens=num_tokens):
+                self.model(
+                    input_ids=self.input_ids[:num_tokens],
+                    positions=self.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                )
+                dummy_compute_logits(self.hidden_states)
+
+    def get_token_top_ks_from_proposals(
+        self,
+        token_ids: torch.Tensor,
+        logits: torch.Tensor,
+        assisted_action_configs: list[str],
+    ) -> torch.Tensor:
+        """Get token top-k values from proposal probabilities.
+
+        Args:
+            proposals: SpeculativeProposals object containing proposal probabilities.
+        Returns:
+            A tensor of shape (batch_size, max_proposal_len) containing the top-k
+            values for each token in the proposals.
+        """
+        model_config = self.vllm_config.model_config
+        batch_size, spec_len = token_ids.shape
+        
+        base_top_k = model_config.get_num_experts_per_token()
+        target_model = self.runner.get_model()
+        assert is_mixture_of_experts(target_model), (
+            "The model must be a mixture of experts model.")
+        num_layers = target_model.num_moe_layers
+        assert num_layers > 0, "No MoE layers found in the model."
+
+        # Assert input tensors are on-device.
+        assert token_ids.device.type == self.device.type, (
+            f"Expected token_ids to be on device {self.device.type}, "
+            f"but got {token_ids.device.type}."
+        )
+        assert logits.device.type == self.device.type, (
+            f"Expected logits to be on device {self.device.type}, "
+            f"but got {logits.device.type}."
+        )
+
+        ppls = calc_perplexity(logits, token_ids)
+
+        total_topks = torch.full(
+            (num_layers, batch_size, spec_len+1),
+            base_top_k,
+            device=self.device,
+        )
+
+        assert len(assisted_action_configs) == batch_size, \
+            f"Expected {batch_size} assisted action configs, " \
+            f"but got {len(assisted_action_configs)}"
+
+        for req_idx, action_cfg in enumerate(assisted_action_configs):
+            action_cfg = UserDefinedFunctionConfig.loads(action_cfg)
+            if action_cfg is None:
+                continue
+            action = load_user_defined_function(action_cfg)
+            with torch.device(self.device):
+                spec_topks = action(ppls[req_idx], model_config.hf_config)
+                # The output token guides the top-k of the input token.
+                total_topks[:, req_idx, :-1] = spec_topks
+                # The last token's top-k is determined by the mean k.
+                if envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN:
+                    last_topks = torch.mean(spec_topks, dim=-1, dtype=torch.float32)
+                    total_topks[:, req_idx, -1] = last_topks
+
+        # Swap num_layers to inner dim for better input organization.
+        total_topks = total_topks.permute(1, 2, 0).contiguous()
+        return total_topks
 
     def generate_token_ids(self,
                            valid_sampled_token_ids: list[list[int]],
@@ -199,7 +267,7 @@ class EagleProposer(Proposer):
             target_slot_mapping = eagle_attn_metadata.slot_mapping[
                 token_indices]
 
-        draft_token_ids = self._propose(
+        draft_token_ids, draft_token_logits = self._propose(
             target_token_ids=target_token_ids,
             target_positions=target_positions,
             target_hidden_states=target_hidden_states,
@@ -209,8 +277,7 @@ class EagleProposer(Proposer):
             block_table=eagle_attn_metadata.block_tables,
             sampling_metadata=sampling_metadata,
         )
-        spec_token_ids = draft_token_ids.tolist()
-        return spec_token_ids
+        return draft_token_ids, draft_token_logits
 
     def _get_eagle_atten_dict(
         self,
@@ -480,14 +547,11 @@ class EagleProposer(Proposer):
         # Early exit if there is only one draft token to be generated.
         if self.vllm_config.speculative_config.num_speculative_tokens == 1:
             # [batch_size, 1]
-            return draft_token_ids.view(-1, 1)
+            return draft_token_ids.view(-1, 1), logits
 
         # Generate the remaining draft tokens.
-        draft_token_ids_tensor = torch.zeros(
-            (self.vllm_config.speculative_config.num_speculative_tokens,
-             *draft_token_ids.shape),
-            dtype=draft_token_ids.dtype)
-        draft_token_ids_tensor[0] = draft_token_ids
+        draft_token_ids_list = [draft_token_ids]
+        draft_token_logits_list = [logits]
 
         positions_cpu = target_positions[last_token_indices].cpu().to(
             torch.int64)
@@ -520,7 +584,7 @@ class EagleProposer(Proposer):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_tensor[now_speculative].to(device)
+            input_ids = draft_token_ids_list[-1].int()
             positions_cpu += 1
 
             # NOTE(woosuk): We should handle the case where the draft model
@@ -591,11 +655,14 @@ class EagleProposer(Proposer):
 
             # TODO(wenlong): get more than one token for tree attention
             draft_token_ids = logits.argmax(dim=-1)
-            draft_token_ids_tensor[now_speculative + 1] = draft_token_ids.cpu()
+            draft_token_ids_list.append(draft_token_ids)
+            draft_token_logits_list.append(logits)
 
         # [batch_size, num_speculative_tokens]
-        draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
-        return draft_token_ids
+        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        # [batch_size, num_speculative_tokens, vocab_size]
+        draft_token_logits = torch.stack(draft_token_logits_list, dim=1)
+        return draft_token_ids, draft_token_logits
 
     def _prepare_inputs(
         self,

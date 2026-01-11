@@ -71,7 +71,9 @@ def set_ascend_forward_context(
         batch_descriptor: Optional[BatchDescriptor] = None,
         prefetch_stream: torch.npu.Stream = None,
         model_instance: torch.nn.Module = None,
-        weight_prefetch_method: Optional[WeightPrefetchMethod] = None):
+        weight_prefetch_method: Optional[WeightPrefetchMethod] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
+):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     We add some additional param into forward_context.
@@ -84,6 +86,7 @@ def set_ascend_forward_context(
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=aclgraph_runtime_mode,
             batch_descriptor=batch_descriptor,
+            token_top_ks=token_top_ks,
     ):
         forward_context = get_forward_context()
 
