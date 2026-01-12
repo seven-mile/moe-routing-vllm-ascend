@@ -2177,28 +2177,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
             sampled_token_ids = sampler_output.sampled_token_ids
             sampled_token_top_ks = sampler_output.sampled_token_top_ks
-            next_draft_first_token_top_ks = self._draft_token_top_ks[:, 0:] if self._draft_token_top_ks is not None else None
             if not self.use_async_scheduling:
                 # Get the valid generated tokens.
                 max_gen_len = sampled_token_ids.shape[-1]
                 if max_gen_len == 1:
                     # No spec decode tokens.
                     valid_sampled_token_ids = sampled_token_ids.tolist()
-                    valid_token_top_ks = next_draft_first_token_top_ks.tolist() if next_draft_first_token_top_ks is not None else []
                 else:
                     # Includes spec decode tokens.
-                    valid_sampled_token_ids, valid_token_top_ks = \
+                    valid_sampled_token_ids, _ = \
                         self.rejection_sampler.parse_output(
                             sampled_token_ids,
-                            sampled_token_top_ks,
-                            next_draft_first_token_top_ks,
                             self.input_batch.vocab_size,
                         )
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
-                    if valid_token_top_ks:
-                        valid_token_top_ks[i].clear()
             else:
                 valid_sampled_token_ids = []
                 valid_token_top_ks = []
@@ -2228,11 +2222,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if self.use_async_scheduling:
                     sampled_ids = [-1] * 1 if \
                         req_idx not in invalid_req_indices_set else None
-                    sampled_top_ks = [] if \
-                        req_idx not in invalid_req_indices_set else None
                 else:
                     sampled_ids = valid_sampled_token_ids[req_idx]
-                    sampled_top_ks = valid_token_top_ks[req_idx] if valid_token_top_ks else []
                 if not sampled_ids:
                     continue
 
@@ -2245,9 +2236,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
                 self.input_batch.token_ids_cpu[req_idx,
                                                start_idx:end_idx] = sampled_ids
-                if sampled_top_ks:
-                    self.input_batch.token_top_ks_cpu[req_idx,
-                                                      start_idx:end_idx] = sampled_top_ks
                 self.input_batch.num_tokens_no_spec[req_idx] = end_idx
                 self.input_batch.num_tokens[req_idx] = end_idx
                 req_id = self.input_batch.req_ids[req_idx]
@@ -2266,6 +2254,29 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     attn_metadata,
                     aux_hidden_states,
                 )
+
+                # valid_token_top_ks depends on draft_token_top_ks, so we
+                # compute it after proposing draft tokens.
+                next_draft_first_token_top_ks = self._draft_token_top_ks[:, 0:] if self._draft_token_top_ks is not None else None
+                if not self.use_async_scheduling:
+                    # Get the valid generated tokens.
+                    max_gen_len = sampled_token_ids.shape[-1]
+                    if max_gen_len == 1:
+                        # No spec decode tokens.
+                        valid_token_top_ks = next_draft_first_token_top_ks.tolist() if next_draft_first_token_top_ks is not None else []
+                    else:
+                        # Includes spec decode tokens.
+                        _, valid_token_top_ks = \
+                            self.rejection_sampler.parse_output(
+                                sampled_token_ids,
+                                self.input_batch.vocab_size,
+                                sampled_token_top_ks,
+                                next_draft_first_token_top_ks,
+                            )
+                    # Mask out the sampled tokens that should not be sampled.
+                    for i in discard_sampled_tokens_req_indices:
+                        if valid_token_top_ks:
+                            valid_token_top_ks[i].clear()
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
