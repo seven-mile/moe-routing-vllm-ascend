@@ -75,10 +75,13 @@ def select_experts(hidden_states: torch.Tensor,
         renormalize=renormalize,
         e_score_correction_bias=e_score_correction_bias,
         num_expert_group=num_expert_group,
+        layer_idx=layer_idx,
         custom_routing_function=custom_routing_function,
         scoring_func=scoring_func,
         routed_scaling_factor=routed_scaling_factor,
-        global_num_experts=global_num_experts)
+        global_num_experts=global_num_experts,
+        token_top_ks=token_top_ks,
+    )
 
     if topk_weights is None:
         topk_weights, topk_ids = _native_select_experts(
@@ -177,16 +180,19 @@ def _select_experts_with_fusion_ops(
         e_score_correction_bias: Optional[torch.Tensor],
         topk_group: Optional[int],
         num_expert_group: Optional[int],
+        layer_idx: int,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         routed_scaling_factor=1.0,
-        global_num_experts: int = -1):
+        global_num_experts: int = -1,
+        token_top_ks: Optional[torch.Tensor] = None,):
 
     topk_weights, topk_ids = None, None
     # NOTE: now npu_moe_gating_top_k can only support 'group_count=256' pattern
     global_redundant_expert_num = get_ascend_config().init_redundancy_expert
     is_deepseek_v3_r1 = global_num_experts - global_redundant_expert_num == 256
     if is_deepseek_v3_r1:
+        raise NotImplementedError
         topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
             router_logits,
             k=top_k,  # topk currently 8
@@ -205,6 +211,13 @@ def _select_experts_with_fusion_ops(
         topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(
             x=router_logits, finished=None, k=top_k)
         topk_ids = topk_ids.to(torch.int32)
+        _apply_token_top_ks(
+            topk_indices=topk_ids,
+            topk_weights=topk_weights,
+            layer_idx=layer_idx,
+            global_num_experts=global_num_experts,
+            token_top_ks=token_top_ks,
+        )
         topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
 
     return topk_weights, topk_ids
@@ -286,6 +299,7 @@ def _native_select_experts(
         topk_indices=topk_ids,
         topk_weights=topk_weights,
         layer_idx=layer_idx,
+        global_num_experts=global_num_experts,
         token_top_ks=token_top_ks,
     )
 
@@ -300,6 +314,7 @@ def _apply_token_top_ks(
     topk_indices: torch.Tensor,
     topk_weights: torch.Tensor,
     layer_idx: int,
+    global_num_experts: int,
     token_top_ks: Optional[torch.Tensor] = None,
 ):
     if token_top_ks is None:
@@ -317,6 +332,6 @@ def _apply_token_top_ks(
     topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
     if topk_indices.dtype == torch.uint32:
         topk_indices = topk_indices.view(torch.int32)
-    topk_indices.masked_fill_(topk_mask, -1)
+    topk_indices.masked_fill_(topk_mask, global_num_experts)
     topk_weights.masked_fill_(topk_mask, 0.0)
 

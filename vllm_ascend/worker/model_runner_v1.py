@@ -1945,18 +1945,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         model_type = self.vllm_config.model_config.hf_config.model_type
 
         if not self.parallel_config.enable_expert_parallel:
-            moe_comm_type = MoECommType.ALLGATHER
+            moe_comm_type = MoECommType.ALLTOALL
         elif soc_version in {AscendSocVersion.A2}:
-            if (num_tokens <= self.mc2_tokens_capacity
-                    and self.parallel_config.world_size_across_dp >= 16):
-                moe_comm_type = MoECommType.MC2
-            else:
-                # Currently, w4a8_dynamic does not support allgatherep
-                if quant_type == "w4a8_dynamic":
-                    moe_comm_type = MoECommType.ALLTOALL
-                else:
-                    moe_comm_type = MoECommType.ALLGATHER
-
+            moe_comm_type = MoECommType.ALLTOALL
         elif soc_version in {AscendSocVersion.A3}:
             moe_comm_type = (MoECommType.MC2
                              if num_tokens <= self.mc2_tokens_capacity else

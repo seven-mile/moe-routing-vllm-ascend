@@ -611,6 +611,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
             indices=topk_ids,
             num_out_tokens=self.num_out_tokens,
         )
+
+        # Masked tokens are sorted to the end, so we slice the valid tokens.
+        local_total_tokens = self.input_splits.sum()
+        permutated_local_input_tokens = permutated_local_input_tokens[
+            :local_total_tokens, :]
+
         return permutated_local_input_tokens, reversed_local_input_permutation_mapping, tokens_per_expert
 
     def _preprocess(self, topk_ids: torch.Tensor) -> torch.Tensor:

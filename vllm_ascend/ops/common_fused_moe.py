@@ -297,9 +297,10 @@ class AscendFusedMoE(FusedMoE):
         # This approach may overlook some extreme scenarios.
         enable_force_load_balance = forward_context.in_profile_run
 
-        hidden_states, router_logits = forward_context.moe_comm_method.prepare(
+        hidden_states, router_logits, token_top_ks = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
+            token_top_ks=token_top_ks,
             replace_allreduce=forward_context.sp_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp)
 
