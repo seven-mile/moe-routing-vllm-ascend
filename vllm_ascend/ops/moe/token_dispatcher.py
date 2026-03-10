@@ -623,7 +623,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         num_local_tokens_per_expert = torch.histc(topk_ids,
                                                   bins=self.num_experts,
                                                   min=0,
-                                                  max=self.num_experts)
+                                                  max=self.num_experts-1)
 
         ep_size = self.ep_size
 
