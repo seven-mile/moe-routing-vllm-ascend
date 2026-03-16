@@ -1529,7 +1529,7 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            self._draft_token_ids = self.propose_draft_token_ids(
+            self._draft_token_ids, self._draft_token_top_ks = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
                 scheduler_output,
@@ -1718,7 +1718,7 @@ class NPUModelRunner(GPUModelRunner):
                 valid_token_top_ks = next_draft_first_token_top_ks.tolist()
             else:
                 # Includes spec decode tokens.
-                valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
+                valid_sampled_token_ids, logprobs_lists, valid_token_top_ks = RejectionSampler.parse_output(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
                     discard_sampled_tokens_req_indices,
@@ -1728,6 +1728,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
         else:
             valid_sampled_token_ids = []
+            valid_token_top_ks = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
