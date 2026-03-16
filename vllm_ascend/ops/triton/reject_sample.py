@@ -44,19 +44,33 @@ def bonus_renew_1(
 @triton.jit(do_not_specialize=["max_spec_len"])
 def rejection_greedy_sample_spec_len_1_triton(
     output_token_ids_ptr,  # [batch_size, 2]
+    output_token_top_ks_ptr,  # [batch_size, 2, num_moe_layers]
     draft_token_ids_ptr,  # [num_tokens]
+    draft_token_top_ks_ptr,  # [num_tokens, num_moe_layers]
     target_argmax_ptr,  # [num_tokens]
     bonus_token_ids_ptr,
     vec_len,
+    num_moe_layers: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block_idx = tl.program_id(0)
     offset = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < vec_len
+    all_layers = tl.arange(0, num_moe_layers)
 
     draft_token_id = tl.load(draft_token_ids_ptr + offset, mask)
     target_argmax_id = tl.load(target_argmax_ptr + offset, mask)
     tl.store(output_token_ids_ptr + offset * 2, target_argmax_id, mask)
+    draft_token_top_k = tl.load(
+        draft_token_top_ks_ptr + offset[:, None] * num_moe_layers + all_layers[None, :],
+        mask=mask[:, None],
+        other=0,
+    )
+    tl.store(
+        output_token_top_ks_ptr + offset[:, None] * 2 * num_moe_layers + all_layers[None, :],
+        draft_token_top_k,
+        mask=mask[:, None],
+    )
 
     for pos in tl.range(0, BLOCK_SIZE):
         draft_token_id1 = get_element(draft_token_id, (pos,))
@@ -85,18 +99,22 @@ def bonus_renew(
 @triton.jit(do_not_specialize=["max_spec_len"])
 def rejection_greedy_sample_triton(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    output_token_top_ks_ptr,  # [batch_size, max_spec_len + 1, num_moe_layers]
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
+    draft_token_top_ks_ptr,  # [num_tokens, num_moe_layers]
     target_argmax_ptr,  # [num_tokens]
     bonus_token_ids_ptr,  # [batch_size]
     is_greedy_ptr,  # [batch_size] or None
     vec_len,
     max_spec_len,
+    num_moe_layers: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block_idx = tl.program_id(0)
     offset = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < vec_len
+    all_layers = tl.arange(0, num_moe_layers)
 
     if is_greedy_ptr is None:
         is_greedy_mask = mask
@@ -122,6 +140,11 @@ def rejection_greedy_sample_triton(
                     output_token_ids_ptr + position * (max_spec_len + 1) + i,
                     target_argmax_id,
                 )
+                draft_token_top_k = tl.load(draft_token_top_ks_ptr + (start_idx1 + i) * num_moe_layers + all_layers)
+                tl.store(
+                    output_token_top_ks_ptr + (position * (max_spec_len + 1) + i) * num_moe_layers + all_layers,
+                    draft_token_top_k,
+                )
                 if draft_token_id != target_argmax_id:
                     # Reject.
                     rejected = True
@@ -139,8 +162,10 @@ def rejection_greedy_sample_triton(
 @triton.jit(do_not_specialize=["max_spec_len"])
 def rejection_random_sample_kernel(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    output_token_top_ks_ptr,  # [batch_size, max_spec_len + 1, num_moe_layers]
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
+    draft_token_top_ks_ptr,  # [num_tokens, num_moe_layers]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
     target_probs_ptr,  # [num_tokens, vocab_size]
     bonus_token_ids_ptr,  # [batch_size]
@@ -150,6 +175,7 @@ def rejection_random_sample_kernel(
     max_spec_len,
     vocab_size,
     vec_len,
+    num_moe_layers: tl.constexpr,
     NO_DRAFT_PROBS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -187,6 +213,12 @@ def rejection_random_sample_kernel(
                         rejected = True
                         token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)
                     tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id)
+                    all_layers = tl.arange(0, num_moe_layers)
+                    draft_token_top_k = tl.load(draft_token_top_ks_ptr + (start_idx + pos) * num_moe_layers + all_layers)
+                    tl.store(
+                        output_token_top_ks_ptr + (req_idx * (max_spec_len + 1) + pos) * num_moe_layers + all_layers,
+                        draft_token_top_k,
+                    )
             if not rejected:
                 # If all tokens are accepted, append the bonus token.
                 bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
@@ -311,13 +343,16 @@ def sample_recovered_tokens_kernel(
 
 def rejection_greedy_sample_with_triton(
     output_token_ids,
+    output_token_top_ks,
     num_draft_tokens,
     cu_num_draft_tokens,
     draft_token_ids,
+    draft_token_top_ks,
     target_argmax,
     bonus_token_ids,
     is_greedy,
     max_spec_len,
+    num_moe_layers,
     grid,
     block_size,
 ):
@@ -326,22 +361,28 @@ def rejection_greedy_sample_with_triton(
     if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and is_greedy is None:
         rejection_greedy_sample_spec_len_1_triton[(grid,)](
             output_token_ids,
+            output_token_top_ks,
             draft_token_ids,
+            draft_token_top_ks,
             target_argmax,
             bonus_token_ids,
             vec_len,
+            num_moe_layers,
             BLOCK_SIZE=block_size,
         )
     else:
         rejection_greedy_sample_triton[(grid,)](
             output_token_ids,
+            output_token_top_ks,
             cu_num_draft_tokens,
             draft_token_ids,
+            draft_token_top_ks,
             target_argmax,
             bonus_token_ids,
             is_greedy,
             vec_len,
             max_spec_len,
+            num_moe_layers,
             BLOCK_SIZE=block_size,
         )
 
@@ -365,8 +406,10 @@ def expand_triton(batch_size, expanded_x, x, cu_num_tokens, replace_from, replac
 @triton.jit(do_not_specialize=["max_spec_len"])
 def rejection_random_sample_block_verify_kernel(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    output_token_top_ks_ptr,  # [batch_size, max_spec_len + 1, num_moe_layers]
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
+    draft_token_top_ks_ptr,  # [num_tokens, num_moe_layers]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
     target_probs_ptr,  # [num_tokens, vocab_size]
     bonus_token_ids_ptr,  # [batch_size]
@@ -376,6 +419,7 @@ def rejection_random_sample_block_verify_kernel(
     max_spec_len,
     vocab_size,
     vec_len,
+    num_moe_layers: tl.constexpr,
     NO_DRAFT_PROBS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -420,12 +464,25 @@ def rejection_random_sample_block_verify_kernel(
                 for pos in range(last_accepted_token_pos + 1):
                     token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
                     tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id)
+                    all_layers = tl.arange(0, num_moe_layers)
+                    draft_token_top_k = tl.load(draft_token_top_ks_ptr + (start_idx + pos) * num_moe_layers + all_layers)
+                    tl.store(
+                        output_token_top_ks_ptr + (req_idx * (max_spec_len + 1) + pos) * num_moe_layers + all_layers,
+                        draft_token_top_k,
+                    )
 
             if rejected:
+                reject_pos = last_accepted_token_pos + 1
                 recovered_token_id = tl.load(recovered_token_ids_ptr + start_idx + last_accepted_token_pos + 1)
                 tl.store(
-                    output_token_ids_ptr + req_idx * (max_spec_len + 1) + last_accepted_token_pos + 1,
+                    output_token_ids_ptr + req_idx * (max_spec_len + 1) + reject_pos,
                     recovered_token_id,
+                )
+                all_layers = tl.arange(0, num_moe_layers)
+                draft_token_top_k = tl.load(draft_token_top_ks_ptr + (start_idx + reject_pos) * num_moe_layers + all_layers)
+                tl.store(
+                    output_token_top_ks_ptr + (req_idx * (max_spec_len + 1) + reject_pos) * num_moe_layers + all_layers,
+                    draft_token_top_k,
                 )
             else:
                 bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)

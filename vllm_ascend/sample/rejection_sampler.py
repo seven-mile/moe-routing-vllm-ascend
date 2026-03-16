@@ -138,20 +138,22 @@ def rejection_sample(
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
     if HAS_TRITON:
         grid, block_size = cal_grid_and_block_size(batch_size)
-        raise NotImplementedError("Triton kernels token top ks NYI.")
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_logits.argmax(dim=-1)
         if HAS_TRITON:
             rejection_greedy_sample_with_triton(
                 output_token_ids,
+                output_token_top_ks,
                 num_draft_tokens,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 target_argmax,
                 bonus_token_ids,
                 is_greedy,
                 max_spec_len,
+                num_moe_layers,
                 grid,
                 block_size,
             )
@@ -201,8 +203,10 @@ def rejection_sample(
         if HAS_TRITON:
             rejection_random_sample_kernel[(grid,)](
                 output_token_ids,
+                output_token_top_ks,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 draft_probs,
                 target_probs,
                 bonus_token_ids,
@@ -212,6 +216,7 @@ def rejection_sample(
                 max_spec_len,
                 vocab_size,
                 batch_size,
+                num_moe_layers,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
             )
@@ -238,8 +243,10 @@ def rejection_sample(
         if HAS_TRITON:
             rejection_random_sample_block_verify_kernel[(grid,)](
                 output_token_ids,
+                output_token_top_ks,
                 cu_num_draft_tokens,
                 draft_token_ids,
+                draft_token_top_ks,
                 draft_probs,
                 target_probs,
                 bonus_token_ids,
@@ -249,6 +256,7 @@ def rejection_sample(
                 max_spec_len,
                 vocab_size,
                 batch_size,
+                num_moe_layers,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
             )
