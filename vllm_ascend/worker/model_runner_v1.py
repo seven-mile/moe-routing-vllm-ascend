@@ -1529,19 +1529,36 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            self._draft_token_ids, self._draft_token_top_ks = self.propose_draft_token_ids(
-                sampled_token_ids,
-                self.input_batch.sampling_metadata,
-                scheduler_output,
-                spec_decode_metadata,
-                spec_decode_common_attn_metadata,
-                positions,
-                scheduler_output.total_num_scheduled_tokens,
-                hidden_states,
-                aux_hidden_states,
-                sample_hidden_states,
+            with record_function_or_nullcontext("draft_token"):
+                self._draft_token_ids, self._draft_token_top_ks = self.propose_draft_token_ids(
+                    sampled_token_ids,
+                    self.input_batch.sampling_metadata,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    positions,
+                    scheduler_output.total_num_scheduled_tokens,
+                    hidden_states,
+                    aux_hidden_states,
+                    sample_hidden_states,
+                )
+                self._copy_draft_token_ids_to_cpu(scheduler_output)
+
+        propose_drafts_after_bookkeeping = False
+        if self.speculative_config:
+            use_padded_batch = (
+                self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
+                and not self.speculative_config.disable_padded_drafter_batch
             )
-            self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if use_padded_batch:
+                # EAGLE speculative decoding can use the GPU sampled tokens
+                # as inputs, and does not need to wait for bookkeeping to finish.
+                propose_draft_token_ids(sampler_output.sampled_token_ids)
+            else:
+                # ngram and other speculative decoding methods use the sampled
+                # tokens on the CPU, so they are run after bookkeeping.
+                propose_drafts_after_bookkeeping = True
+                raise NotImplementedError("token top ks NYI")
 
         (
             logprobs_lists,
@@ -1560,24 +1577,11 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
-        with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config:
-                use_padded_batch = (
-                    self.speculative_config
-                    and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
-                    and not self.speculative_config.disable_padded_drafter_batch
-                )
-                if use_padded_batch:
-                    # EAGLE speculative decoding can use the GPU sampled tokens
-                    # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
-                    # ngram and other speculative decoding methods use the sampled
-                    # tokens on the CPU, so they are run after bookkeeping.
-                    propose_draft_token_ids(valid_sampled_token_ids)
+        if propose_drafts_after_bookkeeping:
+            propose_draft_token_ids(valid_sampled_token_ids)
 
-            if has_kv_transfer_group():
-                get_kv_transfer_group().clear_connector_metadata()
+        if has_kv_transfer_group():
+            get_kv_transfer_group().clear_connector_metadata()
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
