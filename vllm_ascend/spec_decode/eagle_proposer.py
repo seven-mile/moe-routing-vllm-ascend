@@ -940,7 +940,8 @@ class SpecDecodeBaseProposer(EagleProposer):
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[:batch_size] = hidden_states
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -957,9 +958,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             # `model_hidden_states` represent the speculative model inputs.
             model_input_ids = self.input_ids[:input_batch_size]
             model_positions = self._get_positions(input_batch_size)
-            model_hidden_states = self.hidden_states[:input_batch_size]
+            if self.pass_hidden_states_to_model:
+                model_hidden_states = self.hidden_states[:input_batch_size]
 
-            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+                model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
 
             forward_context.attn_metadata = (
                 multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
@@ -1043,7 +1045,8 @@ class SpecDecodeBaseProposer(EagleProposer):
                 target_positions = target_positions[0]
 
             self._set_positions(num_tokens, target_positions)
-            self.hidden_states[:num_tokens] = target_hidden_states
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[:num_tokens] = target_hidden_states
 
             return num_tokens, token_indices_to_sample, cad
         else:
