@@ -233,7 +233,7 @@ def _select_experts_with_fusion_ops(
         k_group=topk_group,
         group_count=num_expert_group,
         group_select_mode=1,
-        renorm=0,
+        renorm=1 if renormalize else 0,
         norm_type=norm_type,  # 0: softmax; 1: sigmoid
         out_flag=False,
         routed_scaling_factor=routed_scaling_factor,
@@ -247,12 +247,6 @@ def _select_experts_with_fusion_ops(
         global_num_experts=global_num_experts,
         token_top_ks=token_top_ks,
     )
-    if renormalize:
-        # TODO
-        topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
-    else:
-        raise NotImplementedError
-
     return topk_weights, topk_ids
 
 
@@ -330,6 +324,10 @@ def _native_select_experts(
     topk_weights, topk_ids = topk_weights.topk(top_k, dim=-1)
     topk_weights = topk_weights.to(hidden_states.dtype)
 
+    # Required by npu_moe_init_routing
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
+
     _apply_token_top_ks(
         topk_indices=topk_ids,
         topk_weights=topk_weights,
@@ -337,10 +335,6 @@ def _native_select_experts(
         global_num_experts=global_num_experts,
         token_top_ks=token_top_ks,
     )
-
-    # Required by npu_moe_init_routing
-    topk_ids = topk_ids.to(torch.int32)
-    topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
 
     return topk_weights, topk_ids
 
