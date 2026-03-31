@@ -535,7 +535,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         )
 
         # Masked tokens are sorted to the end, so we slice the valid tokens.
-        local_total_tokens = self.input_splits.sum()
+        local_total_tokens = input_splits.sum()
         permutated_local_input_tokens = permutated_local_input_tokens[
             :local_total_tokens, :]
 
