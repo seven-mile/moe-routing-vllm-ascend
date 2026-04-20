@@ -153,6 +153,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         else:
             quant_mode = 0
         self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+        x_active_mask = (topk_ids >= 0) & (topk_ids < self.moe_expert_num)
         kwargs_mc2 = {
             "x": hidden_states,
             "expert_ids": topk_ids,
@@ -161,6 +162,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "moe_expert_num": self.moe_expert_num,
             "global_bs": self.global_bs,
             "expert_token_nums_type": 0,
+            "x_active_mask": x_active_mask,
         }
 
         stage1_kwargs = {
@@ -235,6 +237,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "tp_recv_counts": tp_recv_counts,
             "assist_info_for_combine": assist_info_for_combine,
             "expand_scales": expand_scales,
+            "x_active_mask": kwargs_mc2["x_active_mask"],
         }
 
         group_list_type = 0
@@ -254,6 +257,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         tp_recv_counts = context_metadata["tp_recv_counts"]
         assist_info_for_combine = context_metadata["assist_info_for_combine"]
         expand_scales = context_metadata["expand_scales"]
+        x_active_mask = context_metadata["x_active_mask"]
 
         assert expert_map is not None
 
@@ -265,6 +269,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "shared_expert_rank_num": 0,
             "moe_expert_num": self.moe_expert_num,
             "global_bs": self.global_bs,
+            "x_active_mask": x_active_mask,
         }
 
         if self.with_quant:
