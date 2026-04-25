@@ -12,7 +12,7 @@ pandas
 psutil
 setuptools>=64
 setuptools-scm>=8
-torch==2.9.0
+torch==2.10.0
 torchvision
 torchaudio
 wheel
@@ -31,7 +31,7 @@ numba
 # Install torch_npu
 #--pre
 #--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
-torch-npu==2.9.0
+torch_npu @ https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-beta.1-pytorch2.10.0/torch_npu-2.10.0rc3-cp310-cp310-manylinux_2_28_aarch64.whl
 
 arctic-inference==0.1.1
 transformers>=4.57.4
