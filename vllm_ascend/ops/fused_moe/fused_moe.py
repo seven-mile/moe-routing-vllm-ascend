@@ -14,12 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from contextlib import contextmanager, nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
 
 import torch
 import torch.nn.functional as F
+import vllm.envs as envs_vllm
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
@@ -66,6 +68,10 @@ class FusedMoEEvents:
     before_routed_experts: torch.npu.Event
     before_dispatch: torch.npu.Event | None = field(default=None)
     before_combine: torch.npu.Event | None = field(default=None)
+
+
+# FIXME: Replace this hardcoded value with mc2_capacity from runtime metadata.
+MC2_DP_CHUNK_SIZE = 256
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -382,6 +388,184 @@ class AscendFusedMoE(FusedMoE):
         """
         return torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
+    @property
+    def use_dp_chunking(self) -> bool:
+        moe_comm_type = getattr(_EXTRA_CTX, "moe_comm_type", None)
+        return (
+            moe_comm_type in {MoECommType.MC2, MoECommType.FUSED_MC2}
+            and envs_vllm.VLLM_ENABLE_MOE_DP_CHUNK
+        )
+
+    def _update_dynamic_eplb_load(self, fused_experts_results: FusedExpertsResult) -> None:
+        if not self.dynamic_eplb:
+            return
+
+        expert_tokens = fused_experts_results.expert_tokens
+        group_list_type = fused_experts_results.group_list_type
+        assert expert_tokens is not None and group_list_type is not None, (
+            "expert_tokens and group_list_type should not be None when dynamic_eplb is enabled."
+        )
+        local_load = (
+            expert_tokens if group_list_type == 1 else torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
+        )
+        if self.multi_stage:
+            cur_iter = torch.remainder(self.load_counter, self.num_iter)
+            self.moe_load.index_add_(
+                dim=0, index=cur_iter, source=local_load.to(torch.int32, non_blocking=True).view(1, -1)
+            )
+            self.load_counter.add_(1)
+        else:
+            self.moe_load.add_(local_load)
+
+    @contextmanager
+    def _set_chunk_moe_context(self, max_tokens_across_dp: int, num_actual_tokens: int):
+        original_max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
+        original_padded_num_tokens = _EXTRA_CTX.padded_num_tokens
+        original_mc2_mask = getattr(_EXTRA_CTX, "mc2_mask", None)
+
+        _EXTRA_CTX.max_tokens_across_dp = int(max_tokens_across_dp)
+        _EXTRA_CTX.padded_num_tokens = (
+            (_EXTRA_CTX.max_tokens_across_dp + self.tp_size - 1) // self.tp_size
+        ) * self.tp_size
+
+        if original_mc2_mask is not None:
+            chunk_mc2_mask = torch.zeros(_EXTRA_CTX.padded_num_tokens, dtype=torch.bool, device=original_mc2_mask.device)
+            chunk_mc2_mask[:num_actual_tokens] = True
+            _EXTRA_CTX.mc2_mask = chunk_mc2_mask
+
+        try:
+            yield
+        finally:
+            _EXTRA_CTX.max_tokens_across_dp = original_max_tokens_across_dp
+            _EXTRA_CTX.padded_num_tokens = original_padded_num_tokens
+            _EXTRA_CTX.mc2_mask = original_mc2_mask
+
+    def _forward_impl_once(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        token_top_ks: torch.Tensor | None,
+        enable_force_load_balance: bool,
+    ) -> FusedMoEResult:
+        hidden_states, router_logits, token_top_ks, mc2_mask, context_metadata = _EXTRA_CTX.moe_comm_method.prepare(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            token_top_ks=token_top_ks,
+            replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
+            enable_shared_expert_dp=self.enable_shared_expert_dp,
+            quant_type=self.quant_type,
+        )
+
+        if isinstance(hidden_states, tuple):
+            hidden_states, pertoken_scale = hidden_states
+        else:
+            pertoken_scale = None
+
+        fused_experts_results: FusedExpertsResult = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            router_logits=router_logits,
+            pertoken_scale=pertoken_scale,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            global_num_experts=self.global_num_experts,
+            expert_map=self._expert_map,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+            scoring_func=self.scoring_func,
+            routed_scaling_factor=self.routed_scaling_factor,
+            e_score_correction_bias=self.e_score_correction_bias,
+            activation=self.activation,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+            enable_force_load_balance=enable_force_load_balance,
+            log2phy=self.log2phy,
+            global_redundant_expert_num=self.global_redundant_expert_num,
+            mc2_mask=mc2_mask,
+            # NOTE(seven-mile): AscendUnquantizedFusedMoEMethod basically
+            # integrates select_experts into itself. So we need to pass token_top_ks to it.
+            token_top_ks=token_top_ks,
+        )
+
+        self._update_dynamic_eplb_load(fused_experts_results)
+
+        routed_out = _EXTRA_CTX.moe_comm_method.finalize(
+            hidden_states=fused_experts_results.routed_out,
+            reduce_results=self.reduce_results,
+            context_metadata=context_metadata,
+        )
+
+        return FusedMoEResult(
+            routed_out=routed_out,
+            before_dispatch_evt=fused_experts_results.before_dispatch_evt,
+            before_combine_evt=fused_experts_results.before_combine_evt,
+        )
+
+    def _forward_impl_chunked(
+        self,
+        full_hidden_states: torch.Tensor,
+        full_router_logits: torch.Tensor,
+        full_token_top_ks: torch.Tensor | None,
+        enable_force_load_balance: bool,
+    ) -> FusedMoEResult:
+        forward_context = get_forward_context()
+        if forward_context.dp_metadata is not None:
+            max_tokens_across_dispatchers = int(forward_context.dp_metadata.max_tokens_across_dp_cpu)
+        else:
+            max_tokens_across_dispatchers = full_hidden_states.size(0)
+
+        if self.is_sequence_parallel:
+            max_tokens_across_dispatchers = (max_tokens_across_dispatchers + self.sp_size - 1) // self.sp_size
+
+        full_routed_out = torch.empty_like(full_hidden_states)
+        num_tokens = full_hidden_states.size(0)
+        before_dispatch_evt = None
+        before_combine_evt = None
+
+        for chunk_idx, chunk_start_ in enumerate(range(0, max_tokens_across_dispatchers, MC2_DP_CHUNK_SIZE)):
+            chunk_start = min(chunk_start_, max(num_tokens - 1, 0))
+            chunk_end = min(chunk_start + MC2_DP_CHUNK_SIZE, max_tokens_across_dispatchers)
+            # Clamp start and end for the local rank while preserving global loop count.
+            chunk_end = min(chunk_end, num_tokens)
+
+            chunk_top_ks = full_token_top_ks[chunk_start:chunk_end] if full_token_top_ks is not None else None
+
+            chunked_sizes_ctx = (
+                forward_context.dp_metadata.chunked_sizes(self.sp_size, MC2_DP_CHUNK_SIZE, chunk_idx)
+                if forward_context.dp_metadata is not None
+                else nullcontext()
+            )
+            with chunked_sizes_ctx:
+                if forward_context.dp_metadata is not None:
+                    local_sizes = forward_context.dp_metadata.get_chunk_sizes_across_dp_rank()
+                    assert local_sizes is not None
+                    chunk_max_tokens_across_dp = int(max(local_sizes))
+                    local_chunk_num_tokens = int(local_sizes[self.dp_rank])
+                else:
+                    local_chunk_num_tokens = chunk_end - chunk_start
+                    chunk_max_tokens_across_dp = local_chunk_num_tokens
+
+                with self._set_chunk_moe_context(chunk_max_tokens_across_dp, local_chunk_num_tokens):
+                    chunk_results = self._forward_impl_once(
+                        hidden_states=full_hidden_states[chunk_start:chunk_end, :],
+                        router_logits=full_router_logits[chunk_start:chunk_end, :],
+                        token_top_ks=chunk_top_ks,
+                        enable_force_load_balance=enable_force_load_balance,
+                    )
+
+            before_dispatch_evt = chunk_results.before_dispatch_evt
+            before_combine_evt = chunk_results.before_combine_evt
+
+            if chunk_start_ < num_tokens:
+                full_routed_out[chunk_start:chunk_end, :].copy_(chunk_results.routed_out, non_blocking=True)
+
+        return FusedMoEResult(
+            routed_out=full_routed_out,
+            before_dispatch_evt=before_dispatch_evt,
+            before_combine_evt=before_combine_evt,
+        )
+
     if not vllm_version_is("0.16.0"):
 
         def forward(
@@ -411,6 +595,9 @@ class AscendFusedMoE(FusedMoE):
         # TODO: The community only considers load balancing when DP > 1.
         # This approach may overlook some extreme scenarios.
         enable_force_load_balance = _EXTRA_CTX.in_profile_run
+        # Keep the vLLM DP chunking contract for graph-friendly loop bounds,
+        # but avoid combining it with flash common3 gate overlap in this draft.
+        use_chunked_impl = self.use_dp_chunking and not self.multistream_overlap_gate
 
         forward_context = get_forward_context()
         token_top_ks = forward_context.token_top_ks
@@ -456,86 +643,30 @@ class AscendFusedMoE(FusedMoE):
 
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
-        hidden_states, router_logits, token_top_ks, mc2_mask, context_metadata = _EXTRA_CTX.moe_comm_method.prepare(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            token_top_ks=token_top_ks,
-            replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
-            enable_shared_expert_dp=self.enable_shared_expert_dp,
-            quant_type=self.quant_type,
-        )
-
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
-        if isinstance(hidden_states, tuple):
-            hidden_states, pertoken_scale = hidden_states
+        if use_chunked_impl:
+            fused_moe_results = self._forward_impl_chunked(
+                full_hidden_states=hidden_states,
+                full_router_logits=router_logits,
+                full_token_top_ks=token_top_ks,
+                enable_force_load_balance=enable_force_load_balance,
+            )
         else:
-            pertoken_scale = None
-
-        # Matrix multiply.
-        fused_experts_results: FusedExpertsResult = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            router_logits=router_logits,
-            pertoken_scale=pertoken_scale,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            global_num_experts=self.global_num_experts,
-            expert_map=self._expert_map,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            enable_force_load_balance=enable_force_load_balance,
-            log2phy=self.log2phy,
-            global_redundant_expert_num=self.global_redundant_expert_num,
-            mc2_mask=mc2_mask,
-            # NOTE(seven-mile): AscendUnquantizedFusedMoEMethod basically
-            # integrates select_experts into itself. So we need to pass token_top_ks to it.
-            token_top_ks=token_top_ks,
-        )
-
-        if self.dynamic_eplb:
-            expert_tokens = fused_experts_results.expert_tokens
-            group_list_type = fused_experts_results.group_list_type
-            assert expert_tokens is not None and group_list_type is not None, (
-                "expert_tokens and group_list_type should not be None when dynamic_eplb is enabled."
+            fused_moe_results = self._forward_impl_once(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                token_top_ks=token_top_ks,
+                enable_force_load_balance=enable_force_load_balance,
             )
-            local_load = (
-                expert_tokens
-                if group_list_type == 1
-                else torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
-            )
-            if self.multi_stage:
-                cur_iter = torch.remainder(self.load_counter, self.num_iter)
-                self.moe_load.index_add_(
-                    dim=0, index=cur_iter, source=local_load.to(torch.int32, non_blocking=True).view(1, -1)
-                )
-                self.load_counter.add_(1)
-            else:
-                self.moe_load.add_(local_load)
-        routed_out = _EXTRA_CTX.moe_comm_method.finalize(
-            hidden_states=fused_experts_results.routed_out,
-            reduce_results=self.reduce_results,
-            context_metadata=context_metadata,
-        )
 
         if return_with_event:
-            return FusedMoEResult(
-                routed_out=routed_out,
-                before_dispatch_evt=fused_experts_results.before_dispatch_evt,
-                before_combine_evt=fused_experts_results.before_combine_evt,
-            )
+            return fused_moe_results
         else:
             # The vLLM FusedMoE forward_impl does not return events.
-            return routed_out
+            return fused_moe_results.routed_out
 
 
 class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
@@ -630,10 +761,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
 
     @property
     def use_dp_chunking(self) -> bool:
-        """This func routes to the chunked forward path using the FlashInfer Cutlass kernel
-        only when data parallelism (DP) is enabled. Thus just returning False in vllm-ascend
-        """
-        return False
+        return AscendFusedMoE.use_dp_chunking.fget(self)
 
     def forward(
         self,
