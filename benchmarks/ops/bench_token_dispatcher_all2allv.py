@@ -27,7 +27,7 @@ from vllm.distributed.parallel_state import (destroy_distributed_environment,
                                              init_distributed_environment,
                                              initialize_model_parallel)
 from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel
-from vllm_ascend.ops.moe.token_dispatcher import TokenDispatcherWithAll2AllV
+from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAll2AllV
 
 
 @dataclass
@@ -183,29 +183,31 @@ def _run_one_iter(dispatcher: TokenDispatcherWithAll2AllV,
     c_end = torch.npu.Event(enable_timing=True)
 
     d_start.record()
-    out = dispatcher.token_dispatch(hidden_states=hidden_states,
-                                    topk_weights=topk_weights,
-                                    topk_ids=topk_ids,
-                                    expert_map=expert_map)
+    dispatch_result = dispatcher.token_dispatch(hidden_states=hidden_states,
+                                                topk_weights=topk_weights,
+                                                topk_ids=topk_ids,
+                                                expert_map=expert_map)
     d_end.record()
     torch.npu.synchronize()
     dispatch_ms = d_start.elapsed_time(d_end)
 
     # Approximate one-way comm bytes from split sizes in this rank.
-    send_tokens_dispatch = int(dispatcher.input_splits.sum())
-    recv_tokens_dispatch = int(dispatcher.output_splits.sum())
-    elem_size = out["hidden_states"].element_size()
-    hidden_size = out["hidden_states"].shape[-1]
+    dispatch_ctx = dispatch_result.context_metadata
+    send_tokens_dispatch = int(dispatch_ctx["input_splits"].sum())
+    recv_tokens_dispatch = int(dispatch_ctx["output_splits"].sum())
+    elem_size = dispatch_result.hidden_states.element_size()
+    hidden_size = dispatch_result.hidden_states.shape[-1]
     dispatch_send_bytes = send_tokens_dispatch * hidden_size * elem_size
     dispatch_recv_bytes = recv_tokens_dispatch * hidden_size * elem_size
 
     c_start.record()
-    _ = dispatcher.token_combine(out["hidden_states"])
+    _ = dispatcher.token_combine(hidden_states=dispatch_result.hidden_states,
+                                 context_metadata=dispatch_ctx)
     c_end.record()
     torch.npu.synchronize()
     combine_ms = c_start.elapsed_time(c_end)
 
-    # token_combine resets split metadata, so use mirrored stats for combine phase.
+    # Use mirrored stats for combine phase because communication direction is reversed.
     combine_send_bytes = dispatch_recv_bytes
     combine_recv_bytes = dispatch_send_bytes
 
