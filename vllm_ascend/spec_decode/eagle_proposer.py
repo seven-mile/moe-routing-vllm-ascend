@@ -236,6 +236,15 @@ class SpecDecodeBaseProposer(EagleProposer):
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(model)
 
+        if self.vllm_config.compilation_config.cudagraph_mode.decode_mode().has_full_cudagraphs() and self.use_cuda_graph:
+            self.update_stream = torch.npu.Stream()
+            if self.method == "mtp":
+                self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+            else:
+                self._runnable = ACLGraphWrapper(
+                    self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+                )
+
         if self.parallel_drafting and self.pass_hidden_states_to_model:
             assert self.parallel_drafting_hidden_state_tensor is not None
             self.parallel_drafting_hidden_state_tensor.copy_(
@@ -321,15 +330,6 @@ class SpecDecodeBaseProposer(EagleProposer):
             for _, layer_module in self.model.model.layers.items():
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
-
-        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
-            self.update_stream = torch.npu.Stream()
-            if self.method == "mtp":
-                self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-            else:
-                self._runnable = ACLGraphWrapper(
-                    self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
-                )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -672,6 +672,10 @@ class SpecDecodeBaseProposer(EagleProposer):
         builder = self.runner.attn_groups[0][0].get_metadata_builder()
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
 
+        # https://github.com/vllm-project/vllm-ascend/pull/6596
+        if num_input_tokens != num_tokens and attn_metadata.actual_seq_lengths_q:
+            attn_metadata.actual_seq_lengths_q[-1] = num_input_tokens
+
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
@@ -786,7 +790,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            draft_token_ids = self._runnable(
+            draft_token_ids, draft_token_logits = self._runnable(
                 num_input_tokens=num_input_tokens,
                 batch_size=batch_size,
                 token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
@@ -800,7 +804,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                 self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
-        return draft_token_ids
+        # Unpad cuda graph batch size.
+        draft_token_ids = draft_token_ids[:batch_size]
+        draft_token_logits = draft_token_logits[:batch_size] if draft_token_logits is not None else None
+        return draft_token_ids, draft_token_logits
 
     def _run_merged_draft(
         self,
