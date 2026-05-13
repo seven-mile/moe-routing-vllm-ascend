@@ -353,7 +353,16 @@ def unquant_apply_mlp(
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
     else:
-        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+        # TODO: Changes for quant code paths.
+        gate_up_out = torch_npu.npu_clipped_swiglu(
+            gate_up_out,
+            group_index=group_list[-1:],
+            dim=-1,
+            alpha=1.0,
+            limit=float("inf"),
+            bias=0.0,
+            interleaved=False,
+        )
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
