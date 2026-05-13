@@ -254,6 +254,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(model)
 
+        if self.vllm_config.compilation_config.cudagraph_mode.decode_mode().has_full_cudagraphs() and self.use_cuda_graph:
+            self.update_stream = torch.npu.Stream()
+            if self.method == "dflash":
+                self.model = ACLGraphWrapper(
+                    self.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
+            else:
+                self._runnable = ACLGraphWrapper(
+                    self._run_merged_draft,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
+
         if (
             self.parallel_drafting
             and self.pass_hidden_states_to_model
@@ -344,25 +363,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             for _, layer_module in self.model.model.layers.items():
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
-
-        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
-            self.update_stream = torch.npu.Stream()
-            if self.method == "dflash":
-                self.model = ACLGraphWrapper(
-                    self.model,
-                    self.vllm_config,
-                    runtime_mode=CUDAGraphMode.FULL,
-                    use_eagle=self.use_eagle,
-                    enable_enpu=self.enable_enpu,
-                )
-            else:
-                self._runnable = ACLGraphWrapper(
-                    self._run_merged_draft,
-                    self.vllm_config,
-                    runtime_mode=CUDAGraphMode.FULL,
-                    use_eagle=self.use_eagle,
-                    enable_enpu=self.enable_enpu,
-                )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -757,6 +757,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
             attn_metadata.attn_mask = None
 
+        # https://github.com/vllm-project/vllm-ascend/pull/6596
+        # if num_input_tokens != num_tokens and attn_metadata.actual_seq_lengths_q:
+        #     attn_metadata.actual_seq_lengths_q[-1] = num_input_tokens
+
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
@@ -904,11 +908,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-                draft_token_ids = run_draft()
+                draft_token_ids, draft_token_logits = run_draft()
             else:
-                draft_token_ids = run_draft()
+                draft_token_ids, draft_token_logits = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-        return draft_token_ids
+        # Unpad cuda graph batch size.
+        draft_token_ids = draft_token_ids[:batch_size]
+        draft_token_logits = draft_token_logits[:batch_size] if draft_token_logits is not None else None
+        return draft_token_ids, draft_token_logits
 
     def _run_merged_draft(
         self,
