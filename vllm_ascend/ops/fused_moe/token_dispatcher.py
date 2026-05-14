@@ -126,7 +126,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # use global_bs=0 (uniform mode) and pass mc2_mask.
         # When allreduce is skipped, tokens may differ per rank:
         # use the real global_bs and do NOT pass mc2_mask.
-        self.global_bs = _max_global_bs if should_skip_allreduce_across_dp_group(vllm_config) else 0
+        # NOTE: global_bs could not be 0 for A2 full mesh.
+        # TODO: Fuse x_active_mask with existing code path.
+        self.global_bs = _max_global_bs # if should_skip_allreduce_across_dp_group(vllm_config) else 0
 
         # NOTE: When enable_mc2_hierarchy_comm is true, we need pass in `comm_alg` to mc2 op.
         self.need_comm_alg = get_ascend_config().enable_mc2_hierarchy_comm
@@ -221,6 +223,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        print(f"Z {token_dispatch_input.hidden_states.shape=} {kwargs_mc2=}")
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2
