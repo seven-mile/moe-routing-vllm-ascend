@@ -19,6 +19,7 @@ from collections.abc import Callable
 import torch
 
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.utils import get_weight_prefetch_method
 
 
@@ -407,6 +408,9 @@ def _apply_token_top_ks(
     topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
     if topk_indices.dtype == torch.uint32:
         topk_indices = topk_indices.view(torch.int32)
+
+    # NOTE: All2All may work, please double check.
+    assert _EXTRA_CTX.moe_comm_type in (MoECommType.MC2, MoECommType.ALLGATHER), "Unsupported MoE communication type"
     topk_indices.masked_fill_(topk_mask, num_experts)
     topk_weights.masked_fill_(topk_mask, 0.0)
 
