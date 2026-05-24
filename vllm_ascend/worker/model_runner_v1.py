@@ -1915,7 +1915,7 @@ class NPUModelRunner(GPUModelRunner):
                     sample_hidden_states,
                     batch_desc,
                 )
-                # self._copy_draft_token_ids_to_cpu(scheduler_output)
+                self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         propose_drafts_after_bookkeeping = False
         if self.speculative_config:
