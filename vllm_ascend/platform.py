@@ -718,8 +718,9 @@ class NPUPlatform(Platform):
         is_draft_model_prefill = False
 
         in_profile_run = get_mrv2_in_profile_run()
+        max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
         moe_comm_type = select_moe_comm_method(
-            num_tokens,
+            max_num_tokens,
             vllm_config,
             is_draft_model=is_draft_model,
         )
