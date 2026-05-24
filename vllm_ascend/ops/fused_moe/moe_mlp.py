@@ -352,10 +352,16 @@ def unquant_apply_mlp(
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
     else:
+        if group_list_type == 1:
+            group_index = group_list.sum().unsqueeze(0)
+        elif group_list_type == 0:
+            group_index = group_list[-1:]
+        else:
+            raise ValueError(f"Unsupported group_list_type: {group_list_type}")
         # TODO: Changes for quant code paths.
         gate_up_out = torch_npu.npu_clipped_swiglu(
             gate_up_out,
-            group_index=group_list[-1:],
+            group_index=group_index,
             dim=-1,
             alpha=1.0,
             limit=float("inf"),
