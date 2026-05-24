@@ -223,7 +223,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
-        print(f"Z {token_dispatch_input.hidden_states.shape=} {kwargs_mc2=}")
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2

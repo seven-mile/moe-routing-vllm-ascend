@@ -201,8 +201,8 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     if vllm_config.compilation_config.cudagraph_capture_sizes:
         max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
     else:
-        # NOTE: To save memory, we cap the max number of tokens to 256.
-        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 256)
+        # NOTE: To save memory, we cap the max number of tokens to 1024.
+        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 1024)
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     # Use integer arithmetic for ceiling division.
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
@@ -276,8 +276,6 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLGATHER
-
-        moe_comm_type = MoECommType.MC2
     elif soc_version in {AscendDeviceType.A3}:
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
         # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
@@ -310,6 +308,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.ALLTOALL
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
+    print(f"Z {num_tokens=} {mc2_tokens_capacity=} {is_draft_model=} {moe_comm_type=}", flush=True)
     return moe_comm_type
 
 
