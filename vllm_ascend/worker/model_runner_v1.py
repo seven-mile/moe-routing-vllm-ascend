@@ -1688,6 +1688,8 @@ class NPUModelRunner(GPUModelRunner):
                 else total_num_scheduled_tokens,
                 intermediate_tensors,
             )
+            if input_top_ks is not None and num_tokens_padded > total_num_scheduled_tokens:
+                input_top_ks[total_num_scheduled_tokens:num_tokens_padded].zero_()
 
             # update global cos, sin
             update_cos_sin(positions)
