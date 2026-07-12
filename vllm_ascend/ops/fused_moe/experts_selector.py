@@ -18,6 +18,7 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
+import vllm.envs as envs_vllm
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
@@ -46,6 +47,8 @@ def select_experts(
     num_experts: int = -1,
     input_ids: torch.Tensor | None = None,
     tid2eid: torch.Tensor | None = None,
+    token_top_ks: torch.Tensor | None = None,
+    layer_idx: int | None = None,
 ):
     """
     Fused experts with select experts.
@@ -116,6 +119,14 @@ def select_experts(
         # Apply routed scaling factor to weights
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * routed_scaling_factor
+
+    _apply_token_top_ks(
+        topk_indices=topk_ids,
+        topk_weights=topk_weights,
+        layer_idx=layer_idx,
+        num_experts=num_experts,
+        token_top_ks=token_top_ks,
+    )
     if mix_placement:
         shared_expert_routing_factor = 1.0 if is_support_npu_moe_gating_top_k else (1 / routed_scaling_factor)
         batch_size = topk_ids.shape[0]
@@ -415,3 +426,35 @@ def zero_experts_compute(
     expert_scales = torch.where(normal_expert_mask, 0.0, expert_scales)
 
     return expert_indices, expert_scales, result
+
+
+def _apply_token_top_ks(
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    layer_idx: int | None,
+    num_experts: int,
+    token_top_ks: torch.Tensor | None = None,
+) -> None:
+    if token_top_ks is None:
+        return
+    if token_top_ks.ndim == 2:
+        if layer_idx is None:
+            raise ValueError("layer_idx is required for layerwise dynamic top-k")
+        token_top_ks = token_top_ks[:, layer_idx]
+    elif token_top_ks.ndim != 1:
+        raise ValueError("token_top_ks must be a 1D or 2D tensor")
+
+    if token_top_ks.shape != topk_indices.shape[:-1]:
+        raise ValueError(
+            "token_top_ks shape must match the token dimensions of topk_ids: "
+            f"{token_top_ks.shape} != {topk_indices.shape[:-1]}"
+        )
+
+    topk = topk_weights.shape[-1]
+    topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks.unsqueeze(-1)
+    if topk_indices.dtype == torch.uint32:
+        topk_indices = topk_indices.view(torch.int32)
+    if not envs_vllm.VLLM_DYN_TOPKS_NO_DROP_TOKENS:
+        # Ascend routing operators use num_experts as the invalid expert id.
+        topk_indices.masked_fill_(topk_mask, num_experts)
+    topk_weights.masked_fill_(topk_mask, 0.0)

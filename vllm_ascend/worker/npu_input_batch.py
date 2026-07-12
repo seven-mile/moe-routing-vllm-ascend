@@ -237,3 +237,9 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+        # InputBatch owns these fields upstream, but NPUInputBatch initializes
+        # its storage independently instead of calling InputBatch.__init__.
+        self.token_top_ks_cpu_tensor: torch.Tensor | None = None
+        self.token_top_ks_base_value: int | None = None
+        self._dyn_action = None

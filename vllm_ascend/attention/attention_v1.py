@@ -761,6 +761,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         metadata = attn_metadata[draft_step][key]
                         seq_lens = metadata.seq_lens_list
                         actual_seq_lengths_q = metadata.actual_seq_lengths_q
+                        # Draft FULL graphs use a fixed padded query buffer. The
+                        # metadata can retain one extra target token after
+                        # bookkeeping; FIA requires the cumulative q length to
+                        # match the graph query buffer exactly.
+                        query_tokens = query.shape[0]
+                        if actual_seq_lengths_q and actual_seq_lengths_q[-1] != query_tokens:
+                            actual_seq_lengths_q = list(actual_seq_lengths_q)
+                            actual_seq_lengths_q[-1] = query_tokens
                         block_tables = metadata.block_tables
                         attn_count = attn_count + 1
                         if not metadata.causal:

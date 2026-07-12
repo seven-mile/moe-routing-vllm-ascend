@@ -8,6 +8,31 @@ from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+
+
+def test_npu_input_batch_initializes_optional_dynamic_topk_state():
+    group = SimpleNamespace(world_size=1, rank_in_group=0)
+    with (
+        patch("vllm_ascend.worker.block_table.get_pcp_group", return_value=group),
+        patch("vllm_ascend.worker.block_table.get_dcp_group", return_value=group),
+    ):
+        batch = NPUInputBatch(
+            max_num_reqs=2,
+            max_model_len=16,
+            max_num_batched_tokens=16,
+            device=torch.device("cpu"),
+            pin_memory=False,
+            vocab_size=128,
+            block_sizes=[16],
+            kernel_block_sizes=[[16]],
+        )
+
+    assert batch.token_top_ks_cpu_tensor is None
+    assert batch.token_top_ks_base_value is None
+    assert batch._dyn_action is None
+    batch._reset_token_top_ks(0)
+    batch.sync_dyn_assisted_action_to_gpu(1)
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
@@ -244,12 +269,17 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
 
     def test_mtp3_placeholder_metadata_is_preserved_before_sanitizing_forward(self):
         runner = self._build_runner()
+        runner.model = SimpleNamespace(num_moe_layers=48)
+        runner.model_config.get_num_experts_per_token.return_value = 8
         runner.pcp_size = 1
         runner.arange_np = np.arange(8, dtype=np.int32)
         runner._arange_scratch = np.empty(8, dtype=np.int32)
         runner.input_ids = SimpleNamespace(
             cpu=torch.tensor([11, -1, -1, -1], dtype=torch.int32),
             gpu=torch.tensor([11, -1, -1, -1], dtype=torch.int32),
+        )
+        runner._input_top_ks = SimpleNamespace(
+            gpu=torch.tensor([8, 4, 3, 2], dtype=torch.int32),
         )
         scheduler_output = SimpleNamespace(
             scheduled_spec_decode_tokens={"req0": [-1, -1, -1]},
@@ -266,8 +296,34 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         )
 
         self.assertEqual(spec_decode_metadata.draft_token_ids.tolist(), [-1, -1, -1])
+        self.assertEqual(spec_decode_metadata.draft_token_top_ks.tolist(), [4, 3, 2])
         self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 0, 0])
         self.assertEqual(runner.input_ids.cpu.tolist(), [11, -1, -1, -1])
+
+    def test_dense_spec_decode_metadata_uses_zero_topk_compatibility_column(self):
+        runner = self._build_runner()
+        runner.model = SimpleNamespace()
+        runner.model_config.get_num_experts_per_token.return_value = None
+        runner.pcp_size = 1
+        runner.arange_np = np.arange(8, dtype=np.int32)
+        runner._arange_scratch = np.empty(8, dtype=np.int32)
+        runner.input_ids = SimpleNamespace(
+            cpu=torch.tensor([11, -1, -1, -1], dtype=torch.int32),
+            gpu=torch.tensor([11, -1, -1, -1], dtype=torch.int32),
+        )
+        runner._input_top_ks = SimpleNamespace(
+            gpu=torch.zeros(4, dtype=torch.int32),
+        )
+
+        metadata = runner._calc_spec_decode_metadata(
+            num_draft_tokens=np.array([3], dtype=np.int32),
+            cu_num_scheduled_tokens=np.array([4], dtype=np.int32),
+            num_pcp_pads=None,
+        )
+
+        self.assertEqual(metadata.num_moe_layers, 1)
+        self.assertEqual(metadata.base_top_k, 0)
+        self.assertEqual(metadata.draft_token_top_ks.tolist(), [0, 0, 0])
 
 
 class TestNPUModelRunnerDebugger(unittest.TestCase):

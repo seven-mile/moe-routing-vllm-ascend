@@ -188,5 +188,34 @@ class TestAscendFusedMoEMethod(TestBase):
         top_k = 3
         renormalize = True
         self.mock_scheme.apply.return_value = None
-        self.method.apply(layer, x, router_logits, top_k, renormalize)
+        token_top_ks = torch.full((8, 2), top_k, dtype=torch.int32)
+        self.method.apply(
+            layer,
+            x,
+            router_logits,
+            top_k,
+            renormalize,
+            token_top_ks=token_top_ks,
+            layer_idx=1,
+        )
+
         self.mock_scheme.apply.assert_called_once()
+        self.assertIs(
+            self.mock_scheme.apply.call_args.kwargs["token_top_ks"],
+            token_top_ks,
+        )
+        self.assertEqual(self.mock_scheme.apply.call_args.kwargs["layer_idx"], 1)
+
+    def test_apply_method_omits_dynamic_topk_kwargs_by_default(self):
+        self.mock_scheme.apply.return_value = None
+        self.method.apply(
+            torch.nn.Module(),
+            torch.randn(8, 64),
+            torch.randn(8, 64),
+            3,
+            True,
+        )
+
+        kwargs = self.mock_scheme.apply.call_args.kwargs
+        self.assertNotIn("token_top_ks", kwargs)
+        self.assertNotIn("layer_idx", kwargs)

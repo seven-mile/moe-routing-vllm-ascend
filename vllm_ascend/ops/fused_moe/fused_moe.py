@@ -168,6 +168,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         global_redundant_expert_num: int = 0,
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
+        token_top_ks: torch.Tensor | None = None,
+        layer_idx: int | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -187,6 +189,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
+            layer_idx=layer_idx,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
@@ -196,6 +199,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             num_experts=num_logical_experts,
             tid2eid=self.tid2eid,
             input_ids=input_ids,
+            token_top_ks=token_top_ks,
         )
         if vllm_version_is("0.23.0"):
             model_config = layer.vllm_config.model_config
@@ -567,6 +571,9 @@ else:
             self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
         ) -> torch.Tensor | FusedMoEResult:
             forward_context = get_forward_context()
+            token_top_ks = getattr(forward_context, "token_top_ks", None)
+            if not torch.is_tensor(token_top_ks):
+                token_top_ks = None
             # When static kernels are enabled, the forward pass runs twice (compilation + capture),
             # causing moe_layer_index to overflow. Wrap the index to prevent out-of-bounds errors.
             if self.enable_npugraph_ex_static_kernel and forward_context.all_moe_layers:
@@ -603,6 +610,7 @@ else:
                         top_k=self.top_k,
                         use_grouped_topk=self.use_grouped_topk,
                         renormalize=self.renormalize,
+                        layer_idx=self.router.moe_layer_idx,
                         topk_group=self.topk_group,
                         num_expert_group=self.num_expert_group,
                         custom_routing_function=self.custom_routing_function,
@@ -612,6 +620,7 @@ else:
                         num_experts=self.moe_config.num_experts,
                         input_ids=input_ids,
                         tid2eid=self.tid2eid,
+                        token_top_ks=token_top_ks,
                     )
 
                     if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
@@ -623,12 +632,14 @@ else:
             prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                token_top_ks=token_top_ks,
                 replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
                 enable_shared_expert_dp=self.enable_shared_expert_dp,
                 quant_type=self.quant_type,
             )
             hidden_states = prepare_output.hidden_states
             router_logits = prepare_output.router_logits
+            token_top_ks = prepare_output.token_top_ks
             mc2_mask = prepare_output.mc2_mask
             padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
             pertoken_scale = prepare_output.pertoken_scale
@@ -664,6 +675,8 @@ else:
                 log2phy=self.log2phy,
                 global_redundant_expert_num=self.global_redundant_expert_num,
                 mc2_mask=mc2_mask,
+                token_top_ks=token_top_ks,
+                layer_idx=self.router.moe_layer_idx,
             )
 
             if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:

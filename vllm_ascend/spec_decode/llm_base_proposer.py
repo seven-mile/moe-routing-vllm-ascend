@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import vllm.distributed.parallel_state as _ps  # type: ignore[import-not-found]
+from vllm import envs
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.parallel_state import (
     get_pcp_group,
@@ -33,7 +34,10 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+from vllm.v1.spec_decode.llm_base_proposer import (
+    FusedTopKActionTensors,
+    SpecDecodeBaseProposer,
+)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -144,6 +148,22 @@ def _is_glm_model(model_config) -> bool:
 
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
+
+    def _compute_total_top_ks(
+        self,
+        logits: torch.Tensor,
+        action_tensors: FusedTopKActionTensors,
+        base_top_k: int,
+    ) -> torch.Tensor:
+        from vllm.v1.spec_decode.fused_kernel import torch_logits_to_total_topk
+
+        return torch_logits_to_total_topk(
+            logits=logits,
+            cfg_boundaries=action_tensors.cfg_boundaries,
+            layer_mask=action_tensors.layer_mask,
+            base_k=base_top_k,
+            apply_last_token=envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN,
+        )
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
@@ -371,6 +391,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_topk_indices(target_language_model)
         self._maybe_share_lm_head(model)
+        self._maybe_wrap_draft_model()
 
         if (
             self.parallel_drafting
@@ -497,6 +518,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
 
+    def _maybe_wrap_draft_model(self) -> None:
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             logger.info(
                 "[spec_decode/base] Wrapping draft model with ACLGraphWrapper:"
@@ -1075,11 +1097,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-                draft_token_ids = run_draft()
+                draft_output = run_draft()
             else:
-                draft_token_ids = run_draft()
+                draft_output = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-        return draft_token_ids
+
+        # FULL graph replays at a padded batch size. Do not expose those
+        # padding rows to the target model's rejection sampler.
+        draft_token_ids, draft_token_logits = draft_output
+        draft_token_ids = draft_token_ids[:batch_size]
+        if draft_token_logits is not None:
+            draft_token_logits = draft_token_logits[:batch_size]
+        return draft_token_ids, draft_token_logits
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
         if self.method in ("eagle3", "dflash"):
@@ -1200,6 +1229,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if get_ascend_config().enable_reduce_sample:
             if self.method in ("eagle3", "dflash", "mtp"):
                 draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
+                logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable():
                     draft_token_ids, token_indices_to_sample = self._align_tensor_and_indices(
                         draft_token_ids,
@@ -1238,13 +1268,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             # [batch_size, 1]
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            return (
+                draft_token_ids.view(-1, self.num_speculative_tokens),
+                logits.view(-1, self.num_speculative_tokens, logits.shape[-1]),
+            )
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
             draft_token_ids_list = []
+            draft_token_logits_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
-            return torch.stack(draft_token_ids_list, dim=1)
+                draft_token_logits_list.append(logits)
+            return (
+                torch.stack(draft_token_ids_list, dim=1),
+                torch.stack(draft_token_logits_list, dim=1),
+            )
 
         # The logits are split and then merged only when lmhead_tp_enable() is enabled.
         # As a result, the batch size length becomes the actual length 32.
@@ -1259,6 +1297,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             (self.num_speculative_tokens, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
         )
         draft_token_ids_tensor[0] = draft_token_ids
+        draft_token_logits_tensor = torch.empty(
+            (self.num_speculative_tokens, *logits.shape),
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        draft_token_logits_tensor[0] = logits
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
@@ -1362,6 +1406,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if get_ascend_config().enable_reduce_sample:
                 if self.method in ("eagle3", "dflash", "mtp"):
                     draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
+                    logits = self.model.compute_logits(sample_hidden_states)
                     if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
                         draft_token_ids = draft_token_ids[:num_indices]
                         token_indices_to_sample = token_indices_to_sample[:num_indices]
@@ -1385,10 +1430,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
             draft_token_ids_tensor[draft_index + 1] = draft_token_ids
+            draft_token_logits_tensor[draft_index + 1] = logits
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
-        return draft_token_ids
+        draft_token_logits = draft_token_logits_tensor.swapaxes(0, 1)
+        return draft_token_ids, draft_token_logits
 
     def set_inputs_first_pass(
         self,
@@ -1564,8 +1611,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             assert len(self.draft_attn_groups) > 0
             block_size = self.draft_attn_groups[0].kv_cache_spec.block_size
 
+            # FULL-graph metadata can keep padded block-table rows after
+            # ``unpadded()`` while the per-request tensors contain only the
+            # active batch. The upstream helper infers its batch size from the
+            # block table, so pass it an active-row view without changing the
+            # metadata retained for graph execution.
+            slot_mapping_cad = cad
+            active_batch_size = cad.batch_size()
+            if cad.block_table_tensor.shape[0] != active_batch_size:
+                slot_mapping_cad = cad.replace(
+                    block_table_tensor=cad.block_table_tensor[:active_batch_size]
+                )
+
             new_slot_mapping = compute_new_slot_mapping(
-                cad=cad,
+                cad=slot_mapping_cad,
                 new_positions=self.positions[:total_num_output_tokens],
                 is_rejected_token_mask=self.is_rejected_token_mask[:total_num_output_tokens],
                 block_size=block_size,

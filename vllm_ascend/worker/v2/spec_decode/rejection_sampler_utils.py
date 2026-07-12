@@ -19,25 +19,15 @@
 
 import torch
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as gpu_rejection_sampler_utils
 
-from vllm_ascend.utils import vllm_version_is
-
-if not vllm_version_is("0.23.0"):
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _compute_global_logsumexp as _compute_global_lse,
-    )
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _compute_local_logits_stats_kernel as _compute_block_stats_kernel,
-    )
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _insert_resampled_kernel,
-    )
+_insert_resampled_kernel = gpu_rejection_sampler_utils._insert_resampled_kernel
+if hasattr(gpu_rejection_sampler_utils, "_compute_global_logsumexp"):
+    _compute_global_lse = gpu_rejection_sampler_utils._compute_global_logsumexp
+    _compute_block_stats_kernel = gpu_rejection_sampler_utils._compute_local_logits_stats_kernel
 else:
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        _compute_block_stats_kernel,
-        _compute_global_lse,
-        _insert_resampled_kernel,
-    )
+    _compute_global_lse = gpu_rejection_sampler_utils._compute_global_lse
+    _compute_block_stats_kernel = gpu_rejection_sampler_utils._compute_block_stats_kernel
 
 
 @triton.jit

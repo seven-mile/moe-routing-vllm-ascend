@@ -270,7 +270,14 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
+        token_top_ks: torch.Tensor | None = None,
+        layer_idx: int | None = None,
     ) -> torch.Tensor:
+        dynamic_topk_kwargs = {}
+        if token_top_ks is not None:
+            dynamic_topk_kwargs["token_top_ks"] = token_top_ks
+        if layer_idx is not None:
+            dynamic_topk_kwargs["layer_idx"] = layer_idx
         return self.quant_method.apply(
             layer=layer,
             x=x,
@@ -295,6 +302,7 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=apply_router_weight_on_input,
             mc2_mask=mc2_mask,
             tid2eid=self.tid2eid,
+            **dynamic_topk_kwargs,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

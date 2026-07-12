@@ -228,6 +228,13 @@ class AscendRejectionSampler(RejectionSampler):
             sampling_metadata,
             ori_target_logits=raw_target_logits,
         )
+        output_token_top_ks = _build_output_token_top_ks(
+            metadata.draft_token_top_ks,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            metadata.num_moe_layers,
+            metadata.base_top_k,
+        )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -242,8 +249,47 @@ class AscendRejectionSampler(RejectionSampler):
 
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
+            sampled_token_top_ks=output_token_top_ks,
             logprobs_tensors=logprobs_tensors,
         )
+
+
+def _build_output_token_top_ks(
+    draft_token_top_ks: torch.Tensor,
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    num_moe_layers: int,
+    base_top_k: int,
+) -> torch.Tensor:
+    """Align flattened draft top-k plans with rejection-sampler outputs.
+
+    Accepted draft tokens and a recovered token at draft position ``i`` use
+    the plan produced for that position. Bonus tokens retain ``base_top_k``.
+    Placeholder positions are ignored by output parsing, so copying all draft
+    positions is equivalent to copying only the accepted prefix.
+    """
+    batch_size = len(num_draft_tokens)
+    output = torch.full(
+        (batch_size, max_spec_len + 1, num_moe_layers),
+        base_top_k,
+        dtype=torch.int32,
+        device=draft_token_top_ks.device,
+    )
+    if draft_token_top_ks.numel() == 0:
+        return output
+
+    counts = torch.tensor(
+        num_draft_tokens,
+        dtype=torch.int64,
+        device=draft_token_top_ks.device,
+    )
+    request_indices = torch.repeat_interleave(torch.arange(batch_size, device=counts.device), counts)
+    starts = torch.cumsum(counts, dim=0) - counts
+    positions = torch.arange(draft_token_top_ks.shape[0], device=counts.device) - torch.repeat_interleave(
+        starts, counts
+    )
+    output[request_indices, positions] = draft_token_top_ks.to(torch.int32)
+    return output
 
 
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:

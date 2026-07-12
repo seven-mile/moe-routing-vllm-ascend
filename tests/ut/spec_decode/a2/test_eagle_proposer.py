@@ -13,6 +13,7 @@ from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.llm_base_proposer import FusedTopKActionTensors
 
 import vllm_ascend.spec_decode.llm_base_proposer as llm_base_proposer
 from tests.ut.base import TestBase
@@ -182,6 +183,33 @@ def test_prepare_inputs_padded_preserves_internal_seq_lens_cpu():
     assert spec_common_attn_metadata.seq_lens_cpu is None
 
 
+def test_ascend_total_topk_uses_torch_fallback():
+    proposer = llm_base_proposer.AscendSpecDecodeBaseProposer.__new__(
+        llm_base_proposer.AscendSpecDecodeBaseProposer
+    )
+    logits = torch.randn(2, 3, 7)
+    action_tensors = FusedTopKActionTensors(
+        cfg_boundaries=torch.zeros(2, 4),
+        layer_mask=torch.zeros(2, 5, dtype=torch.bool),
+    )
+    expected = torch.ones(2, 4, 5, dtype=torch.int32)
+
+    with patch(
+        "vllm.v1.spec_decode.fused_kernel.torch_logits_to_total_topk",
+        return_value=expected,
+    ) as fallback:
+        actual = proposer._compute_total_top_ks(logits, action_tensors, 4)
+
+    assert actual is expected
+    fallback.assert_called_once_with(
+        logits=logits,
+        cfg_boundaries=action_tensors.cfg_boundaries,
+        layer_mask=action_tensors.layer_mask,
+        base_k=4,
+        apply_last_token=llm_base_proposer.envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN,
+    )
+
+
 class TestEagleProposerInitialization(TestBase):
     def setUp(self):
         self.vllm_config = MagicMock(spec=VllmConfig)
@@ -330,6 +358,14 @@ class TestEagleProposerInitialization(TestBase):
             self.assertTrue(isinstance(proposer, DraftModelProposer))
             self.assertFalse(proposer.pass_hidden_states_to_model)
             self.assertTrue(proposer.needs_extra_input_slots)
+
+    def test_draft_model_load_uses_ascend_graph_wrapper(self):
+        self.assertIs(
+            AscendDraftModelProposer.load_model,
+            llm_base_proposer.AscendSpecDecodeBaseProposer.load_model,
+        )
+        source = inspect.getsource(llm_base_proposer.AscendSpecDecodeBaseProposer.load_model)
+        self.assertIn("self._maybe_wrap_draft_model()", source)
 
 
 @unittest.skip("Skip due to the changes in #7153, fix me later")
@@ -1156,7 +1192,12 @@ class TestEagleProposerPropose:
         self.proposer.attn_layer_names = ['model.layers.36.self_attn.attn']
         self.proposer.kernel_block_size = 128
         self.proposer._runnable = MagicMock()
-        self.proposer._runnable.return_value = [0, 0, 0]
+        padded_draft_token_ids = torch.zeros(4, 3, dtype=torch.int32)
+        padded_draft_token_logits = torch.zeros(4, 3, 5)
+        self.proposer._runnable.return_value = (
+            padded_draft_token_ids,
+            padded_draft_token_logits,
+        )
         captured_common_attn_metadata = None
         original_method = self.proposer.attn_update_stack_num_spec_norm
         mock_bd = MagicMock()
@@ -1304,12 +1345,16 @@ class TestEagleProposerPropose:
             patch.object(self.proposer, 'attn_update_stack_num_spec_norm', side_effect=side_effect),
             set_current_vllm_config(self.vllm_config),
         ):
-            self.proposer._propose(target_token_ids, target_positions, target_hidden_states, next_token_ids,
-                                token_indices_to_sample, mock_common_attn_metadata, target_model_batch_desc, mock_sampling_metadata,
-                                mm_embed_inputs, req_scheduled_tokens, long_seq_metadata, num_prefill_reqs, num_decode_reqs,
-                                scheduler_output, num_scheduled_tokens, num_rejected_tokens_gpu,
-                                )
+            draft_token_ids, draft_token_logits = self.proposer._propose(
+                target_token_ids, target_positions, target_hidden_states, next_token_ids,
+                token_indices_to_sample, mock_common_attn_metadata, target_model_batch_desc, mock_sampling_metadata,
+                mm_embed_inputs, req_scheduled_tokens, long_seq_metadata, num_prefill_reqs, num_decode_reqs,
+                scheduler_output, num_scheduled_tokens, num_rejected_tokens_gpu,
+            )
             self.assert_value_common_attn_metadata(captured_common_attn_metadata, flag_prefill_decode, model_type, graphmode)
+            batch_size = mock_common_attn_metadata.batch_size.return_value
+            assert draft_token_ids.shape == (batch_size, 3)
+            assert draft_token_logits.shape == (batch_size, 3, 5)
 
     # give common_attn_metadata value
     def value_mock_common_attn_metadata(self, mock_common_attn_metadata, query_start_loc, query_start_loc_cpu, seq_lens, num_reqs,
@@ -2866,7 +2911,9 @@ class TestDraftProposerHelperMethods(TestBase):
             max_query_len=5,
             max_seq_len=5,
             num_reqs=1,
-            block_table_tensor=torch.zeros([1,320], dtype=torch.int32),
+            # FULL-graph unpadding retains padded block-table rows while the
+            # other metadata tensors describe only the active request.
+            block_table_tensor=torch.zeros([3,320], dtype=torch.int32),
             slot_mapping=torch.tensor([128,129,130,131], dtype=torch.int32),
         )
         common_attn_metadata.batch_size = lambda: batch_size
@@ -2891,6 +2938,9 @@ class TestDraftProposerHelperMethods(TestBase):
                 num_rejected_tokens_gpu
             )
         )
+        slot_mapping_cad = mock_slot.call_args.kwargs["cad"]
+        assert slot_mapping_cad.block_table_tensor.shape == (batch_size, 320)
+        assert common_attn_metadata.block_table_tensor.shape == (3, 320)
         assert common_attn_metadata.seq_lens.to("cpu") == common_attn_metadata.seq_lens_cpu
 # fmt: on
 

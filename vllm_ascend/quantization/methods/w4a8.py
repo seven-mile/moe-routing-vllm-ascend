@@ -510,6 +510,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
+        token_top_ks: torch.Tensor | None = None,
+        layer_idx: int | None = None,
     ) -> torch.Tensor:
         num_shared_experts = getattr(layer, "n_shared_experts", 0)
         if num_shared_experts is None:
@@ -532,6 +534,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
+            layer_idx=layer_idx,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
@@ -540,6 +543,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             e_score_correction_bias=e_score_correction_bias,
             num_experts=num_logical_experts,
             tid2eid=tid2eid,
+            token_top_ks=token_top_ks,
         )
 
         # this is a naive implementation for experts load balance so as

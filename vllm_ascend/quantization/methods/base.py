@@ -257,6 +257,8 @@ class AscendMoEScheme(ABC):
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
         tid2eid: Any | None = None,
+        token_top_ks: torch.Tensor | None = None,
+        layer_idx: int | None = None,
     ) -> torch.Tensor:
         """Forward computation for MoE layer.
 
@@ -283,6 +285,8 @@ class AscendMoEScheme(ABC):
             activation: Expert MLP activation type.
             apply_router_weight_on_input: Whether to pre-scale hidden states by router weights.
             mc2_mask: Optional mask used by MC2 dispatch.
+            token_top_ks: Optional per-token, per-layer expert counts.
+            layer_idx: Index into the per-layer expert counts.
 
         Returns:
             Output tensor after MoE computation.
